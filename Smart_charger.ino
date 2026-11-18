@@ -1,4 +1,17 @@
 // =====================================================================
+// Bench power supply firmware v0.5.2  (based on v0.5.1)
+// v0.5.2: the set voltage is an ABSOLUTE ceiling - never exceeded, in any
+//         mode. Two changes:
+//         1. applyCv() hard-clamps the CV demand: the effective target is
+//            never higher than vSet + VSET_GUARD (0.15 V), no matter what
+//            trim says. Previously trim parked at -TRIM_MAX in CC, so when
+//            the current limit released, the output jumped ABOVE the set
+//            voltage (toward ~14 V for a 12 V setting) until trim returned.
+//         2. In current limit trim no longer runs to -TRIM_MAX. It now
+//            tracks vbat + CC_CV_MARGIN (0.2 V, capped at vSet): the analog
+//            CC loop gets the minimum injection stress, and releasing the
+//            limit hands over a CV demand already equal to ~the measured
+//            output - no overshoot above vSet at all.
 // Bench power supply firmware v0.5.1  (based on v0.5)
 // v0.5.1: in current limit the trim loop now WITHDRAWS the CV injection
 //         (trim -> -TRIM_MAX, 4 counts per 0.5 s tick) instead of freezing.
@@ -104,7 +117,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.5.1"
+#define FW_VERSION "PSU 0.5.2"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -146,6 +159,8 @@
 #define TRIM_WHEN_OFF   1          // 1 = output switch (IRLB3034 pair) installed: V is valid when OFF, trim runs when OFF too
 #define OUT_TAU_MS      9000.0f    // output discharge time constant (model, used with 'faults 0')
 #define TRIM_MAX        120.0f     // trim authority in PWM counts (~2.3 V)
+#define VSET_GUARD      0.15f      // CV demand never exceeds vSet + this (safety ceiling)
+#define CC_CV_MARGIN    0.20f      // in CC the CV demand tracks vbat + this (<= vSet)
 #define TRIM_LIMIT_ERR  0.4f       // loaded and Vout this far below Vset = current limit: trim is frozen
 #define V_STEP          0.05f      // volts per encoder click (always the same speed)
 #define I_STEP          0.05f      // amps per encoder click
@@ -344,6 +359,11 @@ static void applyCv() {
   uint16_t b = cvVoltsToDuty(vSet);
   if (b == 0) { setCvDuty(0); return; }              // at the ceiling, no injection
   float d = (float)b + trim;
+  // Absolute ceiling: the demand must never exceed vSet + VSET_GUARD,
+  // regardless of trim state (v0.5.2). Duty is inverted: a smaller duty
+  // means a higher demanded voltage, so clamp from below.
+  uint16_t dMin = cvVoltsToDuty(vSet + VSET_GUARD);
+  if (d < (float)dMin) d = (float)dMin;
   if (d < 1.0f) d = 1.0f;
   if (d > 1023.0f) d = 1023.0f;
   setCvDuty((uint16_t)(d + 0.5f));
@@ -493,10 +513,14 @@ static void estimateOutput(float dt) {
   if (vEst > tgt) vEst = tgt + (vEst - tgt) * exp(-dt * 1000.0f / OUT_TAU_MS);
   else            vEst = tgt;
 }
+static bool ccLatch = false;
 static bool inCurrentLimit() {
-  if (!swState || !checksOn) return false;
-  // limit is calibrated (cal lim): CC when the current sits close to the set value
-  return ibat > iSet * 0.88f;
+  if (!swState || !checksOn) { ccLatch = false; return false; }
+  // hysteresis: enter CC at 0.92 x Iset, release below 0.80 x Iset.
+  // Without it the CV and CC controllers flap at the boundary (~2 Hz).
+  if (!ccLatch && ibat > iSet * 0.92f) ccLatch = true;
+  else if (ccLatch && ibat < iSet * 0.80f) ccLatch = false;
+  return ccLatch;
 }
 // 2 Hz: slow correction of the output voltage from the measured value
 static void trimTask() {
@@ -508,13 +532,21 @@ static void trimTask() {
   if (vNow < 1.0f) return;
   float err = vSet - vNow;                              // > 0: output too low
   bool loaded = swState && ibat > 0.3f;
-  // In current limit the analog CC loop must own the FB node: any CV
-  // injection just raises the floor of the limit (measured 2.7 A at iSet
-  // 0.1 A with trim frozen). Withdraw trim (lower duty = less injection)
-  // while CC is active; normal trimming resumes when it releases.
+  // In current limit the analog CC loop owns the FB node. The CV demand
+  // follows the measured output + a small margin (never above vSet): the CC
+  // loop gets minimal injection stress, and when the limit releases the
+  // demand is already ~the measured output, so the voltage can never jump
+  // above the set value (v0.5.2).
   if (inCurrentLimit()) {
-    trim -= 4.0f;
-    if (trim < -TRIM_MAX) trim = -TRIM_MAX;
+    float cvT = vbat + CC_CV_MARGIN;
+    if (cvT > vSet) cvT = vSet;
+    if (cvT < 1.0f) cvT = 1.0f;
+    float t = (float)cvVoltsToDuty(cvT) - (float)cvVoltsToDuty(vSet);
+    if (t < -TRIM_MAX) t = -TRIM_MAX;
+    float d = t - trim;
+    if (d > 4.0f) d = 4.0f;
+    if (d < -4.0f) d = -4.0f;
+    trim += d;
     applyCv();
     return;
   }
