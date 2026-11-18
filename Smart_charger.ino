@@ -1,4 +1,15 @@
 // =====================================================================
+// Bench power supply firmware v0.5.3  (based on v0.5.2)
+// v0.5.3: fixed the slow CC dynamics introduced in v0.5.2.
+//         - In CC trim now TRACKS the target directly instead of slewing
+//           4 counts/0.5 s tick: entering CC at a low output parked trim
+//           hundreds of counts away from the target, so the limit took
+//           ~1 min to settle and the current floated above the setpoint
+//           until it arrived.
+//         - The "relax to trimGood" path (loaded, big CV error) is now
+//           proportional (10%/tick, cap 6 counts) instead of a fixed 2
+//           counts/tick: releasing CC after a long low-current limit hands
+//           the output back to CV in seconds, not ~1 min.
 // Bench power supply firmware v0.5.2  (based on v0.5.1)
 // v0.5.2: the set voltage is an ABSOLUTE ceiling - never exceeded, in any
 //         mode. Two changes:
@@ -117,7 +128,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.5.2"
+#define FW_VERSION "PSU 0.5.3"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -542,19 +553,23 @@ static void trimTask() {
     if (cvT > vSet) cvT = vSet;
     if (cvT < 1.0f) cvT = 1.0f;
     float t = (float)cvVoltsToDuty(cvT) - (float)cvVoltsToDuty(vSet);
+    if (t > 800.0f) t = 800.0f;
     if (t < -TRIM_MAX) t = -TRIM_MAX;
-    float d = t - trim;
-    if (d > 4.0f) d = 4.0f;
-    if (d < -4.0f) d = -4.0f;
-    trim += d;
+    // track directly (not by slow 4-count steps): the CV chain RC filter
+    // smooths the demand, and the analog servo holds the current anyway.
+    // Slew-limited stepping here made the limit settle for ~a minute and
+    // left trim parked far from zero, so releasing CC recovered for ~1 min.
+    trim = t;
     applyCv();
     return;
   }
   if (loaded && err > TRIM_LIMIT_ERR) {
-    // module current limit (or overload), not a CV error: never wind up, relax to the last good value
-    float d = trimGood - trim;
-    if (d > 2.0f) d = 2.0f;
-    if (d < -2.0f) d = -2.0f;
+    // module current limit (or overload), not a CV error: never wind up, relax to the last good value.
+    // Proportional approach (cap 6 counts/tick): after CC the trim can be parked hundreds of
+    // counts away, and a fixed 2-count step took ~1 min to hand the output back to CV.
+    float d = (trimGood - trim) * 0.10f;
+    if (d > 6.0f) d = 6.0f;
+    if (d < -6.0f) d = -6.0f;
     if (d != 0.0f) { trim += d; applyCv(); }
     return;
   }
