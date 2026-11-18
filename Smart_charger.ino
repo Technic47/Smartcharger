@@ -1,4 +1,13 @@
 // =====================================================================
+// Bench power supply firmware v0.5.4  (based on v0.5.3)
+// v0.5.4: the "relax to trimGood" path now SNAPS instead of slewing.
+//         v0.5.3 made it proportional (10%/tick, cap 6 counts @ 2 Hz), which
+//         cut the CC-release recovery from ~1 min to ~10 s, but that is
+//         still a crawl. Overshoot is already impossible: applyCv()
+//         hard-clamps the demand to vSet + VSET_GUARD regardless of trim
+//         (v0.5.2), so trim can jump straight to trimGood - the same move
+//         psuOff() has always done. After releasing CC the output now
+//         recovers at the physical slew rate of the module (~1-2 s).
 // Bench power supply firmware v0.5.3  (based on v0.5.2)
 // v0.5.3: fixed the slow CC dynamics introduced in v0.5.2.
 //         - In CC trim now TRACKS the target directly instead of slewing
@@ -128,7 +137,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.5.3"
+#define FW_VERSION "PSU 0.5.4"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -564,13 +573,13 @@ static void trimTask() {
     return;
   }
   if (loaded && err > TRIM_LIMIT_ERR) {
-    // module current limit (or overload), not a CV error: never wind up, relax to the last good value.
-    // Proportional approach (cap 6 counts/tick): after CC the trim can be parked hundreds of
-    // counts away, and a fixed 2-count step took ~1 min to hand the output back to CV.
-    float d = (trimGood - trim) * 0.10f;
-    if (d > 6.0f) d = 6.0f;
-    if (d < -6.0f) d = -6.0f;
-    if (d != 0.0f) { trim += d; applyCv(); }
+    // module current limit (or overload), not a CV error: never wind up.
+    // Snap straight back to the last good value. The v0.5.2 absolute ceiling
+    // (demand <= vSet + VSET_GUARD regardless of trim) makes overshoot
+    // impossible, so there is nothing to slew-limit: the v0.5.3 proportional
+    // crawl (cap 6 counts/tick @ 2 Hz) still needed ~10 s to hand the output
+    // back to CV after releasing CC. Same move as psuOff().
+    if (trim != trimGood) { trim = trimGood; applyCv(); }
     return;
   }
   if (inCurrentLimit() || !stationary) return;
