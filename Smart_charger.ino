@@ -1,4 +1,14 @@
 // =====================================================================
+// Bench power supply firmware v0.5.5  (based on v0.5.4)
+// v0.5.5: the v0.5.4 relax SNAP became a FAST SLEW (30 counts/tick).
+//         The snap crossed the CC/CV mode boundary with one big step into
+//         the FB node; with the hysteresis latch (enter 0.92 / exit 0.80 x
+//         Iset) a current oscillation crossing both thresholds flipped the
+//         mode every cycle and kicked the analog servo into a limit cycle
+//         (bench: Iset=5 A, bolt load: current slowly approached 5 A, then
+//         hunted 3-6 A forever). Slew keeps the boundary transition gentle;
+//         the v0.5.2 ceiling still rules out overshoot, and full recovery
+//         after CC stays ~2 s.
 // Bench power supply firmware v0.5.4  (based on v0.5.3)
 // v0.5.4: the "relax to trimGood" path now SNAPS instead of slewing.
 //         v0.5.3 made it proportional (10%/tick, cap 6 counts @ 2 Hz), which
@@ -137,7 +147,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.5.4"
+#define FW_VERSION "PSU 0.5.5"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -574,12 +584,19 @@ static void trimTask() {
   }
   if (loaded && err > TRIM_LIMIT_ERR) {
     // module current limit (or overload), not a CV error: never wind up.
-    // Snap straight back to the last good value. The v0.5.2 absolute ceiling
-    // (demand <= vSet + VSET_GUARD regardless of trim) makes overshoot
-    // impossible, so there is nothing to slew-limit: the v0.5.3 proportional
-    // crawl (cap 6 counts/tick @ 2 Hz) still needed ~10 s to hand the output
-    // back to CV after releasing CC. Same move as psuOff().
-    if (trim != trimGood) { trim = trimGood; applyCv(); }
+    // Fast slew back to the last good value (v0.5.5). The v0.5.4 snap crossed
+    // the CC/CV mode boundary with one big step into the FB node; with the
+    // hysteresis latch (enter 0.92 / exit 0.80 x Iset) a current oscillation
+    // that crosses both thresholds flips the mode every cycle, and each flip
+    // kicked the analog servo - bench: at Iset=5 A the current slowly
+    // approached 5 A, then hunted 3-6 A forever. The v0.5.2 ceiling (demand
+    // <= vSet + VSET_GUARD) still rules out overshoot, so a 30 counts/tick
+    // slew (~2 s for the full authority) is safe. Same target as psuOff(),
+    // spread over a few ticks.
+    float d = trimGood - trim;
+    if (d > 30.0f) d = 30.0f;
+    if (d < -30.0f) d = -30.0f;
+    if (d != 0.0f) { trim += d; applyCv(); }
     return;
   }
   if (inCurrentLimit() || !stationary) return;
