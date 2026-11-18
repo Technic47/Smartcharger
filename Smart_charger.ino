@@ -1,4 +1,17 @@
 // =====================================================================
+// Bench power supply firmware v0.6.0  (based on v0.5.5)
+// v0.6.0: DIGITAL CC LOOP (new power board, LM358 analog servo removed).
+//         The CC chain is now D44 -> 10k -> (1uF || 100k) -> 560R -> diode
+//         into the FB node; current is measured by ACS712-20A on A10 (no
+//         shunt, no W signal). A PI controller (ccPiTask, 10 Hz) drives
+//         ccDuty straight from the current error, so the limit no longer
+//         depends on the output voltage or on cal lim / ceil i mapping
+//         calibration - accuracy = ACS712 accuracy. CV-trim logic and the
+//         v0.5.2 absolute ceiling (demand <= vSet + VSET_GUARD) are kept:
+//         in CC the CV demand self-zeros its injection, the two loops
+//         complement instead of fighting, so the old arbitration latch
+//         moves to a simple ccDuty hysteresis (enter > 40, exit < 15).
+//         Set CC_PI to 0 to fall back to the v0.5.5 analog-map behaviour.
 // Bench power supply firmware v0.5.5  (based on v0.5.4)
 // v0.5.5: the v0.5.4 relax SNAP became a FAST SLEW (30 counts/tick).
 //         The snap crossed the CC/CV mode boundary with one big step into
@@ -147,7 +160,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.5.5"
+#define FW_VERSION "PSU 0.6.0"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -191,6 +204,15 @@
 #define TRIM_MAX        120.0f     // trim authority in PWM counts (~2.3 V)
 #define VSET_GUARD      0.15f      // CV demand never exceeds vSet + this (safety ceiling)
 #define CC_CV_MARGIN    0.20f      // in CC the CV demand tracks vbat + this (<= vSet)
+
+// ---------------- digital CC loop (v0.6.0, CC_PI = 1) ----------------
+// PI on the current error, output = raw CC PWM duty (0..1023). The analog
+// reference (LM358, W, shunt) is gone; accuracy = ACS712 accuracy.
+#define CC_PI           1          // 1 = digital current PI (new hardware); 0 = v0.5.5 analog map
+#define CC_PI_KP        150.0f     // proportional term, PWM counts per ampere of error
+#define CC_PI_KI        300.0f     // integral term, counts per (ampere x second)
+#define CC_PI_DUTY_ON   40         // ccDuty above this = current limit active (latch enters)
+#define CC_PI_DUTY_OFF  15         // ccDuty below this = current limit released (latch exits)
 #define TRIM_LIMIT_ERR  0.4f       // loaded and Vout this far below Vset = current limit: trim is frozen
 #define V_STEP          0.05f      // volts per encoder click (always the same speed)
 #define I_STEP          0.05f      // amps per encoder click
@@ -250,6 +272,8 @@ static uint32_t tSpChange = 0;
 
 static uint16_t cvDuty = 1023;
 static uint16_t ccDuty = 1023;
+static float    ccInt = 0;              // v0.6.0: CC PI integrator (counts)
+static uint32_t tCcManual = 0;          // v0.6.0: 'cc N' freezes the PI until this time
 static float    trim = 0;               // PWM counts added to the open-loop CV duty
 static float    trimGood = 0;           // last trim value that gave the right voltage (|err| small)
 static bool     trimEnabled = true;
@@ -400,7 +424,11 @@ static void applyCv() {
 }
 static void applyCc() {
   if (fault) return;
+#if CC_PI
+  setCcDuty(swState ? ccDuty : 0);   // PI mode: ccPiTask owns ccDuty; OFF = no injection
+#else
   setCcDuty(swState ? ccAmpsToDuty(iSet) : 0);     // OFF = lowest limit (~0.1 A)
+#endif
 }
 static void spTouch() { spDirty = true; tSpChange = millis(); }
 static void setV(float v) {
@@ -464,6 +492,7 @@ static bool psuOn(bool force) {
   applyCc();                           // now the real limit
   tSwOn = millis();
   tSetChange = millis();               // let the output settle before trimming
+  ccInt = 0;                           // v0.6.0: fresh PI on every switch-on
   beep(1, 60, 0);
   return true;
 }
@@ -471,6 +500,8 @@ static void psuOff() {
   if (!swState) return;
   openSwitch();
   trim = trimGood;                     // drop any wind-up from the loaded period
+  ccInt = 0;                           // v0.6.0: drop the PI integrator too
+  ccDuty = 0;
   applyCv();
   applyCc();                           // back to the lowest limit
   beep(2, 60, 80);
@@ -546,12 +577,46 @@ static void estimateOutput(float dt) {
 static bool ccLatch = false;
 static bool inCurrentLimit() {
   if (!swState || !checksOn) { ccLatch = false; return false; }
+#if CC_PI
+  // v0.6.0: the PI output itself says whether the limit is engaged.
+  // Hysteresis on ccDuty (not on current) - cleaner than the v0.5.5
+  // 0.92/0.80 x Iset latch, which flapped when the current hunted across
+  // both thresholds at the CC/CV boundary.
+  if (!ccLatch && ccDuty >= CC_PI_DUTY_ON) ccLatch = true;
+  else if (ccLatch && ccDuty <= CC_PI_DUTY_OFF) ccLatch = false;
+  return ccLatch;
+#else
   // hysteresis: enter CC at 0.92 x Iset, release below 0.80 x Iset.
   // Without it the CV and CC controllers flap at the boundary (~2 Hz).
   if (!ccLatch && ibat > iSet * 0.92f) ccLatch = true;
   else if (ccLatch && ibat < iSet * 0.80f) ccLatch = false;
   return ccLatch;
+#endif
 }
+// 10 Hz: digital PI current limiter (v0.6.0). Error = Iset - Ibat; a
+// positive error means the output must inject more into the FB node to pull
+// the current down. Anti-windup: the integrator freezes while the output is
+// saturated (duty pinned at 0 or 1023). Runs only with the output on and the
+// sensors trusted; any other state drives the injection to zero.
+static void ccPiTask(float dt) {
+#if CC_PI
+  if (!swState || fault || !checksOn) {
+    if (ccInt != 0.0f || ccDuty != 0) { ccInt = 0; ccDuty = 0; setCcDuty(0); }
+    return;
+  }
+  if (millis() < tCcManual) return;      // 'cc N' bench test holds the duty
+  float e = iSet - ibat;                 // > 0: current above the setpoint
+  bool satHi = (ccDuty >= 1023 && e > 0);
+  bool satLo = (ccDuty <= 0 && e < 0);
+  if (!satHi && !satLo) ccInt += CC_PI_KI * e * dt;
+  float d = CC_PI_KP * e + ccInt;
+  if (d < 0) d = 0;
+  if (d > 1023) d = 1023;
+  ccDuty = (uint16_t)(d + 0.5f);
+  setCcDuty(ccDuty);
+#endif
+}
+
 // 2 Hz: slow correction of the output voltage from the measured value
 static void trimTask() {
   float vNow = vbat;
@@ -713,7 +778,7 @@ static void drawInfo() {
   u8g2.drawStr(0, 9, b);
   snprintf(b, sizeof b, "CV %4u tr%+d", cvDuty, (int)(trim + (trim >= 0 ? 0.5f : -0.5f)));
   u8g2.drawStr(0, 21, b);
-  snprintf(b, sizeof b, "CC %4u ~%sA", ccDuty, f2(ccDutyToAmps(ccDuty), 1, 1));
+  snprintf(b, sizeof b, "CC %4u ~%sA", ccDuty, f2(ibat, 1, 1));
   u8g2.drawStr(0, 33, b);
   snprintf(b, sizeof b, "Tb%s Th%s Ti%s", fT(tBat), fT(tHeat), fT(tInt));
   u8g2.drawStr(0, 45, b);
@@ -797,7 +862,7 @@ static void execCmd(char* s) {
     return;
   }
   if (!strcmp(cmd, "save")) { cfgSave(); spSaveNow(); Serial.println(F("saved")); return; }
-  if (!strcmp(cmd, "defaults")) { cfgDefaults(); trim = 0; trimGood = 0; if (iSet > iLimit()) iSet = iLimit(); Serial.println(F("defaults loaded (not saved)")); applyCv(); applyCc(); return; }
+  if (!strcmp(cmd, "defaults")) { cfgDefaults(); trim = 0; trimGood = 0; ccInt = 0; if (iSet > iLimit()) iSet = iLimit(); Serial.println(F("defaults loaded (not saved)")); applyCv(); applyCc(); return; }
 
   if (!strcmp(cmd, "v") && a1) { setV(atof(a1)); Serial.print(F("Vset=")); Serial.println(vSet, 2); return; }
   if (!strcmp(cmd, "i") && a1) { setI(atof(a1)); Serial.print(F("Iset=")); Serial.println(iSet, 2); return; }
@@ -849,10 +914,20 @@ static void execCmd(char* s) {
     long d = atol(a1);
     if (d < 0) d = 0;
     if (d > 1023) d = 1023;
+#if CC_PI
+    // v0.6.0: raw bench test of the CC chain. The PI is frozen for 3 s,
+    // then any v/i/on/off command (via applyCc) hands the duty back to it.
+    ccDuty = (uint16_t)d;
+    setCcDuty(ccDuty);
+    tCcManual = millis() + 3000UL;
+    Serial.print(F("raw CC duty=")); Serial.print(ccDuty);
+    Serial.println(F(" (PI frozen 3 s)"));
+#else
     { long dm = ccAmpsToDuty(iLimit()); if (d > dm) d = dm; }   // raw duty is capped by imax too
     setCcDuty((uint16_t)d);
     Serial.print(F("raw CC duty=")); Serial.print(ccDuty);
     Serial.print(F(" (~")); Serial.print(ccDutyToAmps(ccDuty), 2); Serial.println(F(" A by the map)"));
+#endif
     return;
   }
   Serial.println(F("unknown command, try help"));
@@ -952,6 +1027,7 @@ void loop() {
     tMeas = now;
     measure();
     estimateOutput(dt);
+    ccPiTask(dt);
     updateFan();
   }
   if (now - tTrim >= 500) {
