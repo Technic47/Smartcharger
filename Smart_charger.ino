@@ -1,4 +1,11 @@
 // =====================================================================
+// Bench power supply firmware v0.6.1  (based on v0.6.0)
+// v0.6.1: current sensor direction is runtime-configurable: "isign [-1|1]"
+//         (stored in EEPROM, survives reflashes). Bench finding on the
+//         new power board: a flipped ACS712 makes ibat negative, the PI
+//         then sees current far below Iset and pins the injection at
+//         1023 - the output collapses and lowering Iset only relaxes the
+//         collapse. Sign is now a command, not a recompile.
 // Bench power supply firmware v0.6.0  (based on v0.5.5)
 // v0.6.0: DIGITAL CC LOOP (new power board, LM358 analog servo removed).
 //         The CC chain is now D44 -> 10k -> (1uF || 100k) -> 560R -> diode
@@ -160,7 +167,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.6.0"
+#define FW_VERSION "PSU 0.6.1"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -182,7 +189,7 @@
 // ---------------- hardware constants ----------------
 #define VREF            5.0f       // ADC reference, absorbed by calibration
 #define R_SERIES        0.014f     // switch + wires in negative lead, ohm
-#define I_SIGN          1.0f       // set -1.0f if current shows inverted
+#define I_SIGN_DEFAULT 1.0f     // default sensor direction; flip at runtime with "isign -1"
 #define ENC_PULSES      4          // transitions per detent
 #define ENC_DIR         1          // set -1 to reverse rotation
 
@@ -232,6 +239,7 @@ struct Cfg {
   float iCeil;     // CC limit at duty 1023, amps
   float i0;        // CC limit at duty 0, amps (v0.3; old EEPROM images have garbage here)
   float iMax;      // cap of the current setpoint, amps (v0.4; old images: garbage -> 8.0)
+  int8_t  iSign;   // current sensor direction: +1 or -1 (v0.6.1; old images: garbage -> +1)
 };
 #define CFG_MAGIC 0xC47B
 static Cfg cfg;
@@ -245,6 +253,7 @@ static void cfgDefaults() {
   cfg.iCeil   = 8.5f;
   cfg.i0      = 0.30f;
   cfg.iMax    = 8.0f;
+  cfg.iSign   = (int8_t)I_SIGN_DEFAULT;
 }
 static void cfgLoad() {
   Cfg t;
@@ -253,6 +262,7 @@ static void cfgLoad() {
   if (!(cfg.i0 >= 0.0f && cfg.i0 < 2.0f)) cfg.i0 = 0.30f;          // field added in v0.3
   if (!(cfg.iCeil > cfg.i0 + 0.5f && cfg.iCeil < 30.0f)) cfg.iCeil = 8.5f;
   if (!(cfg.iMax >= 0.5f && cfg.iMax <= 30.0f)) cfg.iMax = 8.0f;   // field added in v0.4
+  if (cfg.iSign != 1 && cfg.iSign != -1) cfg.iSign = (int8_t)I_SIGN_DEFAULT;  // field added in v0.6.1
 }
 static void cfgSave() { EEPROM.put(0, cfg); }
 // highest allowed current setpoint: imax, but never above the CC map ceiling
@@ -551,7 +561,7 @@ static void measure() {
   if (!fInit) { fVc = vc; fIc = ic; fInit = true; }
   else { fVc += 0.3f * (vc - fVc); fIc += 0.3f * (ic - fIc); }
 
-  ibat = (fIc - iZero) * cfg.iGain * I_SIGN;
+  ibat = (fIc - iZero) * cfg.iGain * cfg.iSign;
   float vnode = fVc * VREF / 1023.0f;
   vbat = vnode * cfg.kClosed - (swState ? ibat * R_SERIES : 0.0f);
 
@@ -828,7 +838,7 @@ static void printStatus() {
 }
 static void printHelp() {
   Serial.println(F("help st log | v V | i A | on [force] | off | kill | trim 0/1"));
-  Serial.println(F("clr zero faults 0/1 | cal vc V | cal i A | cal lim A | ceil v V | ceil i A | ceil i0 A | imax [A] | cc duty | save | defaults"));
+  Serial.println(F("clr zero faults 0/1 | isign [-1|1] | cal vc V | cal i A | cal lim A | ceil v V | ceil i A | ceil i0 A | imax [A] | cc duty | save | defaults"));
 }
 static void execCmd(char* s) {
   char* cmd = strtok(s, " ");
@@ -846,6 +856,20 @@ static void execCmd(char* s) {
   if (!strcmp(cmd, "zero")) {
     if (swState) { Serial.println(F("refused: switch the output off first")); return; }
     measureZero(); Serial.print(F("zero=")); Serial.println(iZero, 1); return;
+  }
+  if (!strcmp(cmd, "isign")) {
+    if (a1) {
+      int s = atoi(a1);
+      if (s != 1 && s != -1) { Serial.println(F("usage: isign [-1|1]")); return; }
+      if (s != cfg.iSign) {
+        cfg.iSign = (int8_t)s;
+        cfg.iGain = -cfg.iGain;      // keep the calibration valid after the flip
+        ccInt = 0; ccDuty = 0; applyCc();
+        Serial.println(F("isign flipped, iGain sign auto-corrected (not saved until \"save\")"));
+      }
+    }
+    Serial.print(F("isign=")); Serial.println(cfg.iSign);
+    return;
   }
   if (!strcmp(cmd, "faults")) {
     if (swState) { Serial.println(F("refused: switch the output off first")); return; }
@@ -890,7 +914,7 @@ static void execCmd(char* s) {
       cfg.kClosed = (val + (swState ? ibat * R_SERIES : 0.0f)) / vnode;
       Serial.print(F("kClosed=")); Serial.println(cfg.kClosed, 4);
     } else if (!strcmp(a1, "i")) {
-      float dc = (fIc - iZero) * I_SIGN;
+      float dc = (fIc - iZero) * cfg.iSign;
       if (fabs(dc) < 5.0f) { Serial.println(F("current too small")); return; }
       cfg.iGain = val / dc; Serial.print(F("iGain=")); Serial.println(cfg.iGain, 5);
     } else if (!strcmp(a1, "lim")) {
