@@ -1,4 +1,16 @@
 // =====================================================================
+// Bench power supply firmware v0.6.5  (based on v0.6.4)
+// v0.6.5: SETPOINT-CHANGE DEAD TIME + TRIM WIPE REMOVED.
+//         Bench: "v 5" -> "v 10" stalled at 5.9 V; then "v 7" jumped the
+//         output to 10.5 V and crept down. Two pre-vRamp relics caused it:
+//         1. setV() zeroed trim on any jump > 2 V - wiping the CV loop's
+//            only memory; with trim parked at -TRIM_MAX the demand leapt
+//            ~+2.3 V and the output flew past the target.
+//         2. trimTask froze for 3 s after EVERY setpoint change
+//            (tSetChange) - the "does nothing for ~5 s, then dumps" dead
+//            time on a lower target. Now: trim zeroing is gone, and the
+//            freeze applies only for 3 s after the output switch-on
+//            (inrush). Downward jumps rewrite the demand immediately.
 // Bench power supply firmware v0.6.4  (based on v0.6.3)
 // v0.6.4: OVERSHOOT FIX. vslew alone did not remove the overshoot: the CV
 //         injection cap C4 (100 uF) discharges through R13 (100k) with a
@@ -201,7 +213,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.6.4"
+#define FW_VERSION "PSU 0.6.5"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -337,7 +349,6 @@ static uint32_t tCcManual = 0;          // v0.6.0: 'cc N' freezes the PI until t
 static float    trim = 0;               // PWM counts added to the open-loop CV duty
 static float    trimGood = 0;           // last trim value that gave the right voltage (|err| small)
 static bool     trimEnabled = true;
-static uint32_t tSetChange = 0;         // last change of the voltage setting / switch on
 static float    vLast = 0;
 
 static bool     swState = false;        // output ON
@@ -497,9 +508,12 @@ static void setV(float v) {
   if (v > hi) v = hi;
   v = floor(v * 100.0f + 0.5f) / 100.0f;
   if (fabs(v - vSet) < 0.001f) return;
-  if (fabs(v - vSet) > 2.0f) { trim = 0; trimGood = 0; }
+  // v0.6.5: no more trim zeroing on big jumps. It was a pre-vRamp relic that
+  // wiped the only memory the CV loop has: e.g. trim parked at -TRIM_MAX,
+  // then "v 7" zeroed it and the demand jumped ~+2.3 V - the output flew
+  // past the target and crawled back. vRamp moves the demand gradually,
+  // trim now stays continuous across setpoint changes.
   vSet = v;
-  tSetChange = millis();
   spTouch();
   applyCv();
 }
@@ -551,7 +565,6 @@ static bool psuOn(bool force) {
   swState = true;
   applyCc();                           // now the real limit
   tSwOn = millis();
-  tSetChange = millis();               // let the output settle before trimming
   ccInt = 0;                           // v0.6.0: fresh PI on every switch-on
   beep(1, 60, 0);
   return true;
@@ -685,7 +698,10 @@ static void trimTask() {
   bool stationary = fabs(vNow - vLast) < 0.04f;
   vLast = vNow;
   if ((!swState && !TRIM_WHEN_OFF) || fault || !trimEnabled || !checksOn) return;
-  if (millis() - tSetChange < 3000UL) return;           // let it settle first
+  // v0.6.5: freeze only after the output switch-on (inrush); setpoint changes
+  // no longer freeze trim - it tracks vRamp live, and a freeze here was the
+  // multi-second dead time before the output reacted to a lower target.
+  if (swState && millis() - tSwOn < 3000UL) return;
   if (vNow < 1.0f) return;
   float err = vRamp - vNow;                              // > 0: output too low
   bool loaded = swState && ibat > 0.3f;
@@ -1156,7 +1172,10 @@ void loop() {
         if (vRamp > vSet) vRamp = vSet;
         applyCv();
       } else vRamp = vSet;
-    } else if (vRamp > vSet) vRamp = vSet;
+    } else if (vRamp > vSet) {
+      vRamp = vSet;
+      applyCv();                       // v0.6.5: react to a lower target at once
+    }
     updateFan();
   }
   if (now - tTrim >= 500) {
