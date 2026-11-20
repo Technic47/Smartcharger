@@ -1,4 +1,15 @@
 // =====================================================================
+// Bench power supply firmware v0.6.4  (based on v0.6.3)
+// v0.6.4: OVERSHOOT FIX. vslew alone did not remove the overshoot: the CV
+//         injection cap C4 (100 uF) discharges through R13 (100k) with a
+//         ~10 s time constant, so the FB injection lingers after the
+//         demand drops and the output sails above the target while trim
+//         crawls back at 3 counts/tick. Two measures:
+//         1. hardware: C4 100uF -> 10uF (discharge ~1 s). Also speeds up
+//            the post-CC voltage recovery by an order of magnitude.
+//         2. runtime trim rates, no reflash: "vdown [n]" (pull-down,
+//            counts/tick, default 8, was 3) and "vup [n]" (rise rate,
+//            default 20). EEPROM via "save".
 // Bench power supply firmware v0.6.3  (based on v0.6.2)
 // v0.6.3: RUNTIME TUNING, no reflash needed:
 //         - "ccpi [KP KI]"  - CC PI gains (EEPROM; KP 10..1000, KI 10..5000).
@@ -190,7 +201,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.6.3"
+#define FW_VERSION "PSU 0.6.4"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -266,6 +277,8 @@ struct Cfg {
   float ccKp;      // CC PI proportional gain (v0.6.3; old images: garbage -> CC_PI_KP)
   float ccKi;      // CC PI integral gain (v0.6.3)
   float vSlew;     // voltage demand ramp, V/s, 0 = instant (v0.6.3; approach from below)
+  float vDown;     // trim rise cap, counts/tick = output pull-DOWN rate (v0.6.4)
+  float vUp;       // trim fall cap, counts/tick = output rise rate (v0.6.4)
 };
 #define CFG_MAGIC 0xC47B
 static Cfg cfg;
@@ -283,6 +296,8 @@ static void cfgDefaults() {
   cfg.ccKp    = CC_PI_KP;
   cfg.ccKi    = CC_PI_KI;
   cfg.vSlew   = 2.0f;                    // V/s up-ramp: output approaches the target from below
+  cfg.vDown   = 8.0f;                    // counts/tick trim rise (pull output down when too high)
+  cfg.vUp     = 20.0f;                   // counts/tick trim fall (lift output when too low)
 }
 static void cfgLoad() {
   Cfg t;
@@ -295,6 +310,8 @@ static void cfgLoad() {
   if (!(cfg.ccKp >= 10.0f && cfg.ccKp <= 1000.0f)) cfg.ccKp = CC_PI_KP;        // field added in v0.6.3
   if (!(cfg.ccKi >= 10.0f && cfg.ccKi <= 5000.0f)) cfg.ccKi = CC_PI_KI;
   if (!(cfg.vSlew >= 0.0f && cfg.vSlew <= 20.0f))  cfg.vSlew = 2.0f;
+  if (!(cfg.vDown >= 1.0f && cfg.vDown <= 50.0f))  cfg.vDown = 8.0f;   // v0.6.4
+  if (!(cfg.vUp   >= 1.0f && cfg.vUp   <= 50.0f))  cfg.vUp   = 20.0f;
 }
 static void cfgSave() { EEPROM.put(0, cfg); }
 // highest allowed current setpoint: imax, but never above the CC map ceiling
@@ -714,11 +731,14 @@ static void trimTask() {
   float step;
   if (err > 0.03f) {
     step = -err * 40.0f;                                // fewer counts = higher voltage
-    if (step < -20.0f) step = -20.0f;
+    if (step < -cfg.vUp) step = -cfg.vUp;               // v0.6.4: was a hardcoded 20
   } else if (err < -0.06f) {
-    // too high: without a load the output only falls slowly, do not wind up
-    float maxUp = loaded ? 4.0f : 3.0f;
+    // too high: pull the demand down. C4 (CV injection cap) discharges slowly,
+    // so without a brisk trim rise the output sails above the target and then
+    // crawls back for seconds. vDown is the runtime knob (loaded = half rate
+    // to stay gentle against the CC loop).
     step = -err * 40.0f;
+    float maxUp = loaded ? cfg.vDown * 0.5f : cfg.vDown;  // v0.6.4: was 4 / 3
     if (step > maxUp) step = maxUp;
   } else {
     trimGood = trim;                                    // in the dead band: remember this value
@@ -873,7 +893,7 @@ static void printStatus() {
 }
 static void printHelp() {
   Serial.println(F("help st log | v V | i A | on [force] | off | kill | trim 0/1"));
-  Serial.println(F("clr zero faults 0/1 | isign [-1|1] | ccpi [KP KI] | vslew [V/s] | cal vc V | cal i A | cal lim A | ceil v V | ceil i A | ceil i0 A | imax [A] | cc duty | save | defaults"));
+  Serial.println(F("clr zero faults 0/1 | isign [-1|1] | ccpi [KP KI] | vslew [V/s] | vdown [n] | vup [n] | cal vc V | cal i A | cal lim A | ceil v V | ceil i A | ceil i0 A | imax [A] | cc duty | save | defaults"));
 }
 static void execCmd(char* s) {
   char* cmd = strtok(s, " ");
@@ -925,6 +945,24 @@ static void execCmd(char* s) {
       else { Serial.println(F("range: 0..20 V/s (0 = instant)")); return; }
     }
     Serial.print(F("vslew=")); Serial.print(cfg.vSlew, 1); Serial.println(F(" V/s"));
+    return;
+  }
+  if (!strcmp(cmd, "vdown")) {                      // v0.6.4: output pull-down rate, trim counts/tick
+    if (a1) {
+      float s2 = atof(a1);
+      if (s2 >= 1 && s2 <= 50) { cfg.vDown = s2; Serial.println(F("vdown set (not saved until \"save\")")); }
+      else { Serial.println(F("range: 1..50 counts/tick")); return; }
+    }
+    Serial.print(F("vdown=")); Serial.println(cfg.vDown, 0);
+    return;
+  }
+  if (!strcmp(cmd, "vup")) {                        // v0.6.4: output rise rate, trim counts/tick
+    if (a1) {
+      float s2 = atof(a1);
+      if (s2 >= 1 && s2 <= 50) { cfg.vUp = s2; Serial.println(F("vup set (not saved until \"save\")")); }
+      else { Serial.println(F("range: 1..50 counts/tick")); return; }
+    }
+    Serial.print(F("vup=")); Serial.println(cfg.vUp, 0);
     return;
   }
   if (!strcmp(cmd, "faults")) {
