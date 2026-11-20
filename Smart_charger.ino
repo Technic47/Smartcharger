@@ -1,4 +1,14 @@
 // =====================================================================
+// Bench power supply firmware v0.6.2  (based on v0.6.1)
+// v0.6.2: CC PI SIGN FIX. The error was computed as (iSet - ibat) while
+//         the duty is injected proportionally - so the loop drove the
+//         injection to max whenever the measured current was BELOW Iset
+//         and to zero when above it. Bench signature of the bug: the
+//         output collapsed to ~3-5 V right at switch-on, and LOWERING
+//         Iset made the voltage recover (user called it correctly:
+//         "CC logic looks inverted"). Also clamp ccInt to [0, 1023]:
+//         the unbounded integrator wound far below zero and took
+//         minutes to come back after a satLo episode.
 // Bench power supply firmware v0.6.1  (based on v0.6.0)
 // v0.6.1: current sensor direction is runtime-configurable: "isign [-1|1]"
 //         (stored in EEPROM, survives reflashes). Bench finding on the
@@ -167,7 +177,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.6.1"
+#define FW_VERSION "PSU 0.6.2"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -615,10 +625,12 @@ static void ccPiTask(float dt) {
     return;
   }
   if (millis() < tCcManual) return;      // 'cc N' bench test holds the duty
-  float e = iSet - ibat;                 // > 0: current above the setpoint
+  float e = ibat - iSet;                 // > 0: current ABOVE the setpoint -> more injection
   bool satHi = (ccDuty >= 1023 && e > 0);
   bool satLo = (ccDuty <= 0 && e < 0);
   if (!satHi && !satLo) ccInt += CC_PI_KI * e * dt;
+  if (ccInt < 0) ccInt = 0;              // v0.6.2: clamp - an unbounded integrator
+  if (ccInt > 1023) ccInt = 1023;        //   took minutes to recover after satLo
   float d = CC_PI_KP * e + ccInt;
   if (d < 0) d = 0;
   if (d > 1023) d = 1023;
