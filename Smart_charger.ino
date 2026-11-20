@@ -1,4 +1,13 @@
 // =====================================================================
+// Bench power supply firmware v0.7.1  (based on v0.7.0)
+// v0.7.1: ABSOLUTE SETPOINT FLOOR. setV() refused any target below the
+//         linear model's full-injection voltage (cvDutyToVolts(1023)+0.1
+//         = vCeil - 11.74 + 0.1), so the lowest settable output was
+//         ~3.3-4.0 V depending on vCeil - "v 2" snapped to ~4 V. Now the
+//         floor is 2.0 V (= table bottom TAB_V0). Demanding below the
+//         injection ceiling is safe: the duty pins at 1023 and trim just
+//         saturates at +TRIM_MAX. The cal sweep always set vSet directly
+//         and was unaffected.
 // Bench power supply firmware v0.7.0  (based on v0.6.5)
 // v0.7.0: PER-UNIT CV DUTY TABLE + ON-DEVICE CALIBRATION.
 //         The linear open-loop map cvVoltsToDuty() starts a hair off on
@@ -235,7 +244,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.7.0"
+#define FW_VERSION "PSU 0.7.1"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -568,7 +577,12 @@ static void applyCc() {
 }
 static void spTouch() { spDirty = true; tSpChange = millis(); }
 static void setV(float v) {
-  float lo = cvDutyToVolts(1023) + 0.1f, hi = cfg.vCeil;
+  // v0.7.1: the floor is absolute (2.0 V = table bottom), not the linear
+  // model's full-injection voltage (vCeil - 11.74). The model floor put the
+  // minimum setpoint at ~3.3-4.0 V depending on vCeil, so "v 2" silently
+  // snapped to ~4 V. Demanding below the injection ceiling is harmless:
+  // applyCv() pins the duty at 1023 and trim saturates at +TRIM_MAX.
+  float lo = TAB_V0, hi = cfg.vCeil;
   if (v < lo) v = lo;
   if (v > hi) v = hi;
   v = floor(v * 100.0f + 0.5f) / 100.0f;
