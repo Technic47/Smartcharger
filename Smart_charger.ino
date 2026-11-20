@@ -1,4 +1,17 @@
 // =====================================================================
+// Bench power supply firmware v0.6.3  (based on v0.6.2)
+// v0.6.3: RUNTIME TUNING, no reflash needed:
+//         - "ccpi [KP KI]"  - CC PI gains (EEPROM; KP 10..1000, KI 10..5000).
+//           Bench: the current took 5-10 s to reach the setpoint with the
+//           compiled-in 150/300; try 300/600 first.
+//         - "vslew [V/s]"   - voltage demand up-ramp (0 = instant, default 2).
+//           The open-loop duty map always started a hair HIGH, so a new
+//           voltage overshot the setpoint and trim crawled it down at
+//           2 Hz (up to 3 counts/tick). Now an internal vRamp chases
+//           vSet from below at vslew and applyCv()/trimTask regulate to
+//           vRamp - the output approaches the target without overshoot.
+//           Downward jumps stay instant (the output falls at its physical
+//           rate anyway).
 // Bench power supply firmware v0.6.2  (based on v0.6.1)
 // v0.6.2: CC PI SIGN FIX. The error was computed as (iSet - ibat) while
 //         the duty is injected proportionally - so the loop drove the
@@ -177,7 +190,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.6.2"
+#define FW_VERSION "PSU 0.6.3"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -250,6 +263,9 @@ struct Cfg {
   float i0;        // CC limit at duty 0, amps (v0.3; old EEPROM images have garbage here)
   float iMax;      // cap of the current setpoint, amps (v0.4; old images: garbage -> 8.0)
   int8_t  iSign;   // current sensor direction: +1 or -1 (v0.6.1; old images: garbage -> +1)
+  float ccKp;      // CC PI proportional gain (v0.6.3; old images: garbage -> CC_PI_KP)
+  float ccKi;      // CC PI integral gain (v0.6.3)
+  float vSlew;     // voltage demand ramp, V/s, 0 = instant (v0.6.3; approach from below)
 };
 #define CFG_MAGIC 0xC47B
 static Cfg cfg;
@@ -264,6 +280,9 @@ static void cfgDefaults() {
   cfg.i0      = 0.30f;
   cfg.iMax    = 8.0f;
   cfg.iSign   = (int8_t)I_SIGN_DEFAULT;
+  cfg.ccKp    = CC_PI_KP;
+  cfg.ccKi    = CC_PI_KI;
+  cfg.vSlew   = 2.0f;                    // V/s up-ramp: output approaches the target from below
 }
 static void cfgLoad() {
   Cfg t;
@@ -273,6 +292,9 @@ static void cfgLoad() {
   if (!(cfg.iCeil > cfg.i0 + 0.5f && cfg.iCeil < 30.0f)) cfg.iCeil = 8.5f;
   if (!(cfg.iMax >= 0.5f && cfg.iMax <= 30.0f)) cfg.iMax = 8.0f;   // field added in v0.4
   if (cfg.iSign != 1 && cfg.iSign != -1) cfg.iSign = (int8_t)I_SIGN_DEFAULT;  // field added in v0.6.1
+  if (!(cfg.ccKp >= 10.0f && cfg.ccKp <= 1000.0f)) cfg.ccKp = CC_PI_KP;        // field added in v0.6.3
+  if (!(cfg.ccKi >= 10.0f && cfg.ccKi <= 5000.0f)) cfg.ccKi = CC_PI_KI;
+  if (!(cfg.vSlew >= 0.0f && cfg.vSlew <= 20.0f))  cfg.vSlew = 2.0f;
 }
 static void cfgSave() { EEPROM.put(0, cfg); }
 // highest allowed current setpoint: imax, but never above the CC map ceiling
@@ -287,6 +309,7 @@ U8G2_ST7920_128X64_F_SW_SPI u8g2(U8G2_R0, /*clock=*/23, /*data=*/17, /*cs=*/16);
 
 // ---------------- state ----------------
 static float    vSet = 5.0f, iSet = 1.0f;
+static float    vRamp = 5.0f;           // v0.6.3: slew-limited demand, chases vSet from below
 static bool     spDirty = false;
 static uint32_t tSpChange = 0;
 
@@ -430,13 +453,13 @@ static void beepTask() {
 // ---------------- setpoints -> PWM ----------------
 static void applyCv() {
   if (fault) return;
-  uint16_t b = cvVoltsToDuty(vSet);
+  uint16_t b = cvVoltsToDuty(vRamp);
   if (b == 0) { setCvDuty(0); return; }              // at the ceiling, no injection
   float d = (float)b + trim;
-  // Absolute ceiling: the demand must never exceed vSet + VSET_GUARD,
-  // regardless of trim state (v0.5.2). Duty is inverted: a smaller duty
+  // Absolute ceiling: the demand must never exceed the (ramped) set value
+  // + VSET_GUARD, regardless of trim state (v0.5.2). Duty is inverted: a smaller duty
   // means a higher demanded voltage, so clamp from below.
-  uint16_t dMin = cvVoltsToDuty(vSet + VSET_GUARD);
+  uint16_t dMin = cvVoltsToDuty(vRamp + VSET_GUARD);
   if (d < (float)dMin) d = (float)dMin;
   if (d < 1.0f) d = 1.0f;
   if (d > 1023.0f) d = 1023.0f;
@@ -628,10 +651,10 @@ static void ccPiTask(float dt) {
   float e = ibat - iSet;                 // > 0: current ABOVE the setpoint -> more injection
   bool satHi = (ccDuty >= 1023 && e > 0);
   bool satLo = (ccDuty <= 0 && e < 0);
-  if (!satHi && !satLo) ccInt += CC_PI_KI * e * dt;
+  if (!satHi && !satLo) ccInt += cfg.ccKi * e * dt;
   if (ccInt < 0) ccInt = 0;              // v0.6.2: clamp - an unbounded integrator
   if (ccInt > 1023) ccInt = 1023;        //   took minutes to recover after satLo
-  float d = CC_PI_KP * e + ccInt;
+  float d = cfg.ccKp * e + ccInt;
   if (d < 0) d = 0;
   if (d > 1023) d = 1023;
   ccDuty = (uint16_t)(d + 0.5f);
@@ -647,7 +670,7 @@ static void trimTask() {
   if ((!swState && !TRIM_WHEN_OFF) || fault || !trimEnabled || !checksOn) return;
   if (millis() - tSetChange < 3000UL) return;           // let it settle first
   if (vNow < 1.0f) return;
-  float err = vSet - vNow;                              // > 0: output too low
+  float err = vRamp - vNow;                              // > 0: output too low
   bool loaded = swState && ibat > 0.3f;
   // In current limit the analog CC loop owns the FB node. The CV demand
   // follows the measured output + a small margin (never above vSet): the CC
@@ -656,7 +679,7 @@ static void trimTask() {
   // above the set value (v0.5.2).
   if (inCurrentLimit()) {
     float cvT = vbat + CC_CV_MARGIN;
-    if (cvT > vSet) cvT = vSet;
+    if (cvT > vRamp) cvT = vRamp;
     if (cvT < 1.0f) cvT = 1.0f;
     float t = (float)cvVoltsToDuty(cvT) - (float)cvVoltsToDuty(vSet);
     if (t > 800.0f) t = 800.0f;
@@ -850,7 +873,7 @@ static void printStatus() {
 }
 static void printHelp() {
   Serial.println(F("help st log | v V | i A | on [force] | off | kill | trim 0/1"));
-  Serial.println(F("clr zero faults 0/1 | isign [-1|1] | cal vc V | cal i A | cal lim A | ceil v V | ceil i A | ceil i0 A | imax [A] | cc duty | save | defaults"));
+  Serial.println(F("clr zero faults 0/1 | isign [-1|1] | ccpi [KP KI] | vslew [V/s] | cal vc V | cal i A | cal lim A | ceil v V | ceil i A | ceil i0 A | imax [A] | cc duty | save | defaults"));
 }
 static void execCmd(char* s) {
   char* cmd = strtok(s, " ");
@@ -881,6 +904,27 @@ static void execCmd(char* s) {
       }
     }
     Serial.print(F("isign=")); Serial.println(cfg.iSign);
+    return;
+  }
+  if (!strcmp(cmd, "ccpi")) {                       // v0.6.3: runtime CC PI gains
+    if (a1 && a2) {
+      float p = atof(a1), i = atof(a2);
+      if (p >= 10 && p <= 1000 && i >= 10 && i <= 5000) {
+        cfg.ccKp = p; cfg.ccKi = i; ccInt = 0;
+        Serial.println(F("ccpi set (not saved until \"save\")"));
+      } else { Serial.println(F("range: KP 10..1000, KI 10..5000")); return; }
+    }
+    Serial.print(F("KP=")); Serial.print(cfg.ccKp, 0);
+    Serial.print(F(" KI=")); Serial.println(cfg.ccKi, 0);
+    return;
+  }
+  if (!strcmp(cmd, "vslew")) {                      // v0.6.3: voltage up-ramp, V/s
+    if (a1) {
+      float s2 = atof(a1);
+      if (s2 >= 0 && s2 <= 20) { cfg.vSlew = s2; Serial.println(F("vslew set (not saved until \"save\")")); }
+      else { Serial.println(F("range: 0..20 V/s (0 = instant)")); return; }
+    }
+    Serial.print(F("vslew=")); Serial.print(cfg.vSlew, 1); Serial.println(F(" V/s"));
     return;
   }
   if (!strcmp(cmd, "faults")) {
@@ -1064,6 +1108,17 @@ void loop() {
     measure();
     estimateOutput(dt);
     ccPiTask(dt);
+    // v0.6.3: ramp the voltage demand up at cfg.vSlew (0 = instant). Downward
+    // jumps stay instant - the output can only fall at its physical rate anyway.
+    // trimTask and applyCv both work off vRamp, so trim never winds up chasing
+    // a target the output has not reached yet (no more overshoot-then-crawl).
+    if (vSet > vRamp) {
+      if (cfg.vSlew > 0) {
+        vRamp += cfg.vSlew * dt;
+        if (vRamp > vSet) vRamp = vSet;
+        applyCv();
+      } else vRamp = vSet;
+    } else if (vRamp > vSet) vRamp = vSet;
     updateFan();
   }
   if (now - tTrim >= 500) {
