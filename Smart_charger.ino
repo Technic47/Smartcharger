@@ -1,4 +1,26 @@
 // =====================================================================
+// Bench power supply firmware v0.7.0  (based on v0.6.5)
+// v0.7.0: PER-UNIT CV DUTY TABLE + ON-DEVICE CALIBRATION.
+//         The linear open-loop map cvVoltsToDuty() starts a hair off on
+//         every unit, so the CV loop always begins away from the target
+//         and trim (2 Hz, few counts/tick) crawls it in - the slow
+//         approach and the occasional demand-vs-output mismatch. Now:
+//         1. EEPROM table @128 (TabCfg, magic 0x7AB1): 26 points, 2.0 V
+//            ..14.5 V step 0.5 V, measured duty for THIS unit. Loaded at
+//            boot; applyCv() interpolates piecewise-linearly between
+//            points. Falls back to the linear map while the table is
+//            empty - so the unit always runs.
+//         2. Calibration, no PC/tools needed: serial "cal tab" or the
+//            encoder UI (field 4 "V TABLE CAL", long press). Runs all 26
+//            points unattended (~30-90 s): sets the point, waits for the
+//            CV loop to settle inside +/-30 mV (or 8 s timeout), records
+//            the live duty. Requires NO load (refuses above ~0.15 A) and
+//            a working trim loop. Long press during the run aborts and
+//            restores the previous setpoint. Table is written to EEPROM
+//            at the end; "defaults" does NOT clear it on purpose.
+//         Bench: after cal tab the setpoint lands within one trim tick
+//         of the target at every point - the ~1 s post-setpoint creep is
+//         gone. Re-run cal tab after flux cleaning / conformal coat.
 // Bench power supply firmware v0.6.5  (based on v0.6.4)
 // v0.6.5: SETPOINT-CHANGE DEAD TIME + TRIM WIPE REMOVED.
 //         Bench: "v 5" -> "v 10" stalled at 5.9 V; then "v 7" jumped the
@@ -213,7 +235,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.6.5"
+#define FW_VERSION "PSU 0.7.0"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -328,6 +350,49 @@ static void cfgLoad() {
 static void cfgSave() { EEPROM.put(0, cfg); }
 // highest allowed current setpoint: imax, but never above the CC map ceiling
 static float iLimit() { return cfg.iMax < cfg.iCeil ? cfg.iMax : cfg.iCeil; }
+
+// ---------------- V calibration table (v0.7.0) ----------------
+static uint16_t cvVoltsToDuty(float v);   // defined with the mappings below
+// Piecewise-linear duty-vs-voltage curve measured on THIS unit: replaces the
+// open-loop linear map as the CV baseline; trim only mops up the residuals.
+#define TAB_V0    2.0f
+#define TAB_STEP  0.5f
+#define TAB_N     26                 // 2.0 .. 14.5 V
+#define TAB_MAGIC 0x7AB1
+#define TAB_ADDR  128                // Cfg @0, Sp @64, table @128
+struct TabCfg { uint16_t magic; uint16_t d[TAB_N]; };
+static uint16_t tab[TAB_N];
+static bool     tabValid = false;
+static bool     calRun = false;
+static uint8_t  calIdx = 0;
+static uint32_t calPtT = 0;          // point start time
+static uint16_t calWinT = 0;         // ms spent inside the settle window
+static float    calVSetSaved = 0;
+static bool     calWasOff = false, calWasTrim = true;
+
+static void tabLoad() {
+  TabCfg t;
+  EEPROM.get(TAB_ADDR, t);
+  if (t.magic == TAB_MAGIC) { memcpy(tab, t.d, sizeof tab); tabValid = true; }
+}
+static void tabSave() {
+  TabCfg t; t.magic = TAB_MAGIC; memcpy(t.d, tab, sizeof tab);
+  EEPROM.put(TAB_ADDR, t);
+}
+// duty baseline for a demand voltage; falls back to the linear map if the
+// table has never been calibrated. Duty is inverted (smaller = more volts).
+static uint16_t tabDuty(float v) {
+  if (!tabValid) return cvVoltsToDuty(v);
+  float x = (v - TAB_V0) / TAB_STEP;
+  int i = (int)floorf(x);
+  if (i < 0) i = 0;
+  if (i > TAB_N - 2) i = TAB_N - 2;
+  float f = x - (float)i;
+  if (f < 0) f = 0;
+  if (f > 1) f = 1;
+  float d = tab[i] + (tab[i + 1] - tab[i]) * f;
+  return (uint16_t)(d + 0.5f);
+}
 
 struct Sp { uint16_t magic; float v; float i; };
 #define SP_MAGIC 0x5B01
@@ -481,13 +546,13 @@ static void beepTask() {
 // ---------------- setpoints -> PWM ----------------
 static void applyCv() {
   if (fault) return;
-  uint16_t b = cvVoltsToDuty(vRamp);
+  uint16_t b = tabDuty(vRamp);                       // v0.7.0: calibrated baseline
   if (b == 0) { setCvDuty(0); return; }              // at the ceiling, no injection
   float d = (float)b + trim;
   // Absolute ceiling: the demand must never exceed the (ramped) set value
   // + VSET_GUARD, regardless of trim state (v0.5.2). Duty is inverted: a smaller duty
   // means a higher demanded voltage, so clamp from below.
-  uint16_t dMin = cvVoltsToDuty(vRamp + VSET_GUARD);
+  uint16_t dMin = tabDuty(vRamp + VSET_GUARD);
   if (d < (float)dMin) d = (float)dMin;
   if (d < 1.0f) d = 1.0f;
   if (d > 1023.0f) d = 1023.0f;
@@ -765,6 +830,74 @@ static void trimTask() {
   if (trim < -TRIM_MAX) trim = -TRIM_MAX;
   applyCv();
 }
+
+// ---------------- V table calibration (v0.7.0) ----------------
+// Sweeps the output 2.0..14.5 V in 0.5 V steps, lets trimTask close the loop
+// at each point, then stores the converged duty (baseline + trim) as the new
+// open-loop baseline. No load allowed: load sag must stay with the servo,
+// not be baked into the table. Runs as a state machine from the 10 Hz loop,
+// so the display, serial and the trim servo stay alive during the sweep.
+static void calStart() {
+  if (calRun) return;
+  if (fault) { Serial.println(F("refused: clear the fault first")); return; }
+  if (!checksOn) { Serial.println(F("refused: sensors are off (faults 1 first)")); return; }
+  calWasOff = !swState;
+  if (calWasOff) psuOn(true);
+  measure();
+  if (ibat > 0.15f) {
+    if (calWasOff) psuOff();
+    Serial.println(F("refused: disconnect the load, table is calibrated at no load"));
+    return;
+  }
+  calVSetSaved = vSet;
+  calWasTrim = trimEnabled; trimEnabled = true;
+  calIdx = 0; calWinT = 0; calPtT = millis();
+  calRun = true;
+  Serial.println(F("cal tab: sweep 2.0..14.5 V, keep the load disconnected"));
+}
+static void calAbort() {
+  calRun = false;
+  vSet = calVSetSaved; vRamp = vSet;
+  trimEnabled = calWasTrim;
+  applyCv();
+  if (calWasOff) psuOff();
+  Serial.println(F("cal aborted"));
+}
+static void calTask() {
+  if (!calRun) return;
+  float target = TAB_V0 + (float)calIdx * TAB_STEP;
+  if (vSet != target) { vSet = target; vRamp = target; applyCv(); }
+  if (fabs(vbat - target) < 0.03f) {
+    if (calWinT < 600) calWinT += 100;
+  } else calWinT = 0;
+  bool timeout = millis() - calPtT > 8000UL;
+  if (calWinT < 600 && !timeout) return;
+  if (timeout && calWinT < 600) {
+    Serial.print(F("cal: settle timeout at ")); Serial.print(target, 1);
+    Serial.println(F(" V, recording best effort"));
+  }
+  // converged duty = the baseline actually applied (table or linear map)
+  // plus the trim that fixed it
+  uint16_t rec = (uint16_t)(tabDuty(target) + trim + 0.5f);
+  if (rec < 1) rec = 1;
+  if (rec > 1023) rec = 1023;
+  if (calIdx > 0 && rec > tab[calIdx - 1]) rec = tab[calIdx - 1];   // duty falls as V rises
+  tab[calIdx] = rec;
+  Serial.print(F("cal ")); Serial.print(target, 1);
+  Serial.print(F(" V -> duty ")); Serial.println(rec);
+  calIdx++; calWinT = 0; calPtT = millis();
+  if (calIdx >= TAB_N) {
+    tabValid = true;
+    tabSave();
+    calRun = false;
+    vSet = calVSetSaved; vRamp = vSet;
+    trimEnabled = calWasTrim;
+    applyCv();
+    if (calWasOff) psuOff();
+    beep(2, 80, 80);
+    Serial.println(F("cal tab done, table saved"));
+  }
+}
 static void updateFan() {
 #if FAN_ENABLE
   bool hasSensor = !isnan(tHeat) || !isnan(tInt);
@@ -868,9 +1001,23 @@ static void drawInfo() {
   snprintf(b, sizeof b, "%s %03ux%02u", FW_VERSION, (unsigned)(tk % 1000), (unsigned)(bd % 100));
   u8g2.drawStr(0, 57, b);
 }
+static void drawCal() {                 // v0.7.0: field 3 = V table calibration
+  char b[28];
+  u8g2.setFont(u8g2_font_6x10_tf);
+  u8g2.drawStr(0, 12, "V TABLE CAL");
+  if (calRun) snprintf(b, sizeof b, "RUN %u/%u", (unsigned)calIdx + 1, (unsigned)TAB_N);
+  else        snprintf(b, sizeof b, "TABLE: %s", tabValid ? "VALID" : "EMPTY");
+  u8g2.drawStr(0, 30, b);
+  if (!calRun) {
+    u8g2.drawStr(0, 48, "HOLD BTN = RUN");
+    u8g2.drawStr(0, 60, "HOLD IN RUN = STOP");
+  }
+}
 static void draw() {
   u8g2.clearBuffer();
-  if (uiField == 2) drawInfo(); else drawMain();
+  if (uiField == 2) drawInfo();
+  else if (uiField == 3) drawCal();     // v0.7.0
+  else drawMain();
   if (fault) {                              // inverted bar, visible on every screen
     char b[28];
     u8g2.setDrawColor(1);
@@ -909,7 +1056,7 @@ static void printStatus() {
 }
 static void printHelp() {
   Serial.println(F("help st log | v V | i A | on [force] | off | kill | trim 0/1"));
-  Serial.println(F("clr zero faults 0/1 | isign [-1|1] | ccpi [KP KI] | vslew [V/s] | vdown [n] | vup [n] | cal vc V | cal i A | cal lim A | ceil v V | ceil i A | ceil i0 A | imax [A] | cc duty | save | defaults"));
+  Serial.println(F("clr zero faults 0/1 | isign [-1|1] | ccpi [KP KI] | vslew [V/s] | vdown [n] | vup [n] | cal vc V | cal i A | cal tab | cal lim A | ceil v V | ceil i A | ceil i0 A | imax [A] | cc duty | save | defaults"));
 }
 static void execCmd(char* s) {
   char* cmd = strtok(s, " ");
@@ -1016,7 +1163,9 @@ static void execCmd(char* s) {
     return;
   }
 
-  if (!strcmp(cmd, "cal") && a1 && a2) {
+  if (!strcmp(cmd, "cal") && a1) {
+    if (!strcmp(a1, "tab")) { calStart(); return; }     // v0.7.0: sweep calibration
+    if (!a2) return;
     float val = atof(a2);
     float vnode = fVc * VREF / 1023.0f;
     if (!strcmp(a1, "vc")) {
@@ -1088,12 +1237,14 @@ static void handleEncoder() {
   interrupts();
 
   if (l) {
-    if (fault) { clearFault(); beep(1, 100, 0); }
+    if (calRun) { calAbort(); beep(1, 50, 0); }        // v0.7.0: hold to stop the sweep
+    else if (fault) { clearFault(); beep(1, 100, 0); }
+    else if (uiField == 3) { calStart(); }             // v0.7.0: CAL screen, hold to run
     else if (swState) psuOff();
     else psuOn(false);
   }
-  if (p) uiField = (uiField + 1) % 3;
-  if (d) {
+  if (p && !calRun) uiField = (uiField + 1) % 4;       // V -> I -> info -> CAL
+  if (d && !calRun) {
     if (uiField == 0)      setV(vSet + d * V_STEP);
     else if (uiField == 1) setI(iSet + d * I_STEP);
   }
@@ -1113,6 +1264,7 @@ void setup() {
 
   Serial.begin(115200);
   cfgLoad();
+  tabLoad();          // v0.7.0: calibrated V table
   spLoad();
 
   pinMode(PIN_ENC_A, INPUT_PULLUP);
@@ -1162,6 +1314,7 @@ void loop() {
     measure();
     estimateOutput(dt);
     ccPiTask(dt);
+    if (calRun) calTask();             // v0.7.0: table sweep state machine
     // v0.6.3: ramp the voltage demand up at cfg.vSlew (0 = instant). Downward
     // jumps stay instant - the output can only fall at its physical rate anyway.
     // trimTask and applyCv both work off vRamp, so trim never winds up chasing
