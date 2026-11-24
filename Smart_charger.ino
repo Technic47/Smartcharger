@@ -1,4 +1,14 @@
 // =====================================================================
+// Bench power supply firmware v0.7.6  (based on v0.7.5)
+// v0.7.6: CORRUPTION BISECTION. The v0.7.5 ring caught tabDuty returning
+//         duty values outside its mathematical clamp range (b up to 61831)
+//         in 9 of 10 slots, with the garbage forming an arithmetic
+//         progression - classic signature of foreign float bytes landing
+//         on the uint16 arrays. The ring gains dMin and a live tab[20]
+//         snapshot; the new "draw 0/1" command freezes the display update.
+//         Bisection plan: v 12 -> cvdump (expect garbage), then "draw 0",
+//         v 5, v 12, cvdump - if the slots come out clean, the corruption
+//         source lives in the draw path (u8g2 / dtostrf formatting).
 // Bench power supply firmware v0.7.5  (based on v0.7.4)
 // v0.7.5: applyCv INPUT RING. The v0.7.4 trace caught applyCv itself
 //         writing cvDuty=1023 with st showing vr=12.00, trim=0.0, tab=1,
@@ -305,7 +315,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.7.5"
+#define FW_VERSION "PSU 0.7.6"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -484,7 +494,9 @@ static uint16_t    cvWn  = 0;           // v0.7.4: CV duty write counter (st: cv
 #define CV_TRACE_N 10
 static float   cvT_vr[CV_TRACE_N]; static uint16_t cvT_b[CV_TRACE_N];
 static float   cvT_tr[CV_TRACE_N]; static uint16_t cvT_d[CV_TRACE_N];
+static uint16_t cvT_min[CV_TRACE_N]; static uint16_t cvT_t20[CV_TRACE_N];
 static uint8_t cvT_i = 0;
+static bool   drawOn = true;            // v0.7.6: "draw 0" freezes the display (bisection)
 static uint16_t ccDuty = 1023;
 static float    ccInt = 0;              // v0.6.0: CC PI integrator (counts)
 static uint32_t tCcManual = 0;          // v0.6.0: 'cc N' freezes the PI until this time
@@ -641,6 +653,8 @@ static void applyCv() {
   cvWho = "applyCv";
   cvT_vr[cvT_i] = vRamp; cvT_b[cvT_i] = b; cvT_tr[cvT_i] = trim;
   cvT_d[cvT_i] = (uint16_t)(d + 0.5f);
+  cvT_min[cvT_i] = dMin;
+  cvT_t20[cvT_i] = tabValid ? tab[20] : 0xFFFF;
   cvT_i = (cvT_i + 1) % CV_TRACE_N;
   setCvDuty((uint16_t)(d + 0.5f));
 }
@@ -1191,6 +1205,7 @@ static void execCmd(char* s) {
 
   if (!strcmp(cmd, "help")) { printHelp(); return; }
   if (!strcmp(cmd, "st")) { printStatus(); return; }
+  if (!strcmp(cmd, "draw") && a1) { drawOn = atoi(a1) != 0; Serial.println(drawOn ? F("draw on") : F("draw OFF (frozen)")); return; }   // v0.7.6 bisection
   if (!strcmp(cmd, "log")) { logOn = a1 && atoi(a1); Serial.println(logOn ? F("log on") : F("log off")); return; }
   if (!strcmp(cmd, "off")) { psuOff(); printStatus(); return; }
   if (!strcmp(cmd, "cvdump")) {                       // v0.7.5: applyCv input ring
@@ -1203,7 +1218,9 @@ static void execCmd(char* s) {
       Serial.print(F("] vr=")); Serial.print(cvT_vr[j], 2);
       Serial.print(F(" b=")); Serial.print(cvT_b[j]);
       Serial.print(F(" trim=")); Serial.print(cvT_tr[j], 1);
-      Serial.print(F(" d=")); Serial.println(cvT_d[j]);
+      Serial.print(F(" d=")); Serial.print(cvT_d[j]);
+      Serial.print(F(" dMin=")); Serial.print(cvT_min[j]);
+      Serial.print(F(" t20=")); Serial.println(cvT_t20[j]);
     }
     return;
   }
@@ -1485,7 +1502,7 @@ void loop() {
     trimTask();
   }
   if (spDirty && now - tSpChange > 5000UL) spSaveNow();
-  if (now - tDraw >= 150) {
+  if (drawOn && now - tDraw >= 150) {   // v0.7.6: "draw 0" skips updates (bisection)
     tDraw = now;
     draw();
   }
