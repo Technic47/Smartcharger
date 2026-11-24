@@ -1,4 +1,24 @@
 // =====================================================================
+// Bench power supply firmware v0.7.4  (based on v0.7.3)
+// v0.7.4: CV DEMAND TRACE + THREE REAL BUGFIXES.
+//         Bench: Vset=12, healthy table (tabDuty(12)=326, trim=-20), yet
+//         cvDuty sat at 1023 - mathematically impossible via applyCv, and
+//         no applyCv call path explained it. st gains cvW= (last duty
+//         writer: boot/applyCv/safe) + cvN= (write counter) + sl= (vSlew)
+//         to catch the culprit red-handed instead of guessing.
+//         Fixes:
+//         1. Ramp: the vslew==0 ("instant") branch set vRamp but forgot
+//            applyCv() - after such a jump the demand was never refreshed,
+//            the output froze at the old demand (bench: "only the cal
+//            sweep regulates, normal setpoints do nothing").
+//         2. cal tab: a settle-timeout point was recorded into the table
+//            anyway ("best effort") - a sweep over a broken chain stamped
+//            a VALID table full of 1023s. Now a timed-out point is skipped
+//            (the slot gets the linear-map estimate) and >=3 timeouts
+//            abort the sweep, leaving the table INVALID (linear fallback).
+//         3. setV() was silent when the setpoint got clamped to [2.0,
+//            vCeil] - "v 12" that silently becomes Vset=2.00 now prints a
+//            note.
 // Bench power supply firmware v0.7.3  (based on v0.7.2)
 // v0.7.3: DIAGNOSTICS FOR THE STUCK cv=1023 STATE (no logic changes).
 //         Bench after flashing v0.7.2 + running "cal tab": during the sweep
@@ -277,7 +297,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.7.3"
+#define FW_VERSION "PSU 0.7.4"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -450,6 +470,8 @@ static bool     spDirty = false;
 static uint32_t tSpChange = 0;
 
 static uint16_t cvDuty = 1023;
+static const char* cvWho = "boot";      // v0.7.4: last CV duty writer (st: cvW=)
+static uint16_t    cvWn  = 0;           // v0.7.4: CV duty write counter (st: cvN=)
 static uint16_t ccDuty = 1023;
 static float    ccInt = 0;              // v0.6.0: CC PI integrator (counts)
 static uint32_t tCcManual = 0;          // v0.6.0: 'cc N' freezes the PI until this time
@@ -519,7 +541,7 @@ static void pwmInit() {
 // duty 0 -> pin held LOW (no 1-clock spike of fast PWM at OCR=0)
 static void setCvDuty(uint16_t d) {
   if (d > 1023) d = 1023;
-  cvDuty = d;
+  cvDuty = d; cvWn++;
   if (d == 0) { TCCR3A &= ~_BV(COM3A1); digitalWrite(PIN_CV_PWM, LOW); }
   else        { OCR3A = d; TCCR3A |= _BV(COM3A1); }
 }
@@ -594,7 +616,7 @@ static void beepTask() {
 static void applyCv() {
   if (fault) return;
   uint16_t b = tabDuty(vRamp);                       // v0.7.0: calibrated baseline
-  if (b == 0) { setCvDuty(0); return; }              // at the ceiling, no injection
+  if (b == 0) { cvWho = "applyCv"; setCvDuty(0); return; }   // at the ceiling, no injection
   float d = (float)b + trim;
   // Absolute ceiling: the demand must never exceed the (ramped) set value
   // + VSET_GUARD, regardless of trim state (v0.5.2). Duty is inverted: a smaller duty
@@ -603,6 +625,7 @@ static void applyCv() {
   if (d < (float)dMin) d = (float)dMin;
   if (d < 1.0f) d = 1.0f;
   if (d > 1023.0f) d = 1023.0f;
+  cvWho = "applyCv";
   setCvDuty((uint16_t)(d + 0.5f));
 }
 static void applyCc() {
@@ -621,8 +644,8 @@ static void setV(float v) {
   // snapped to ~4 V. Demanding below the injection ceiling is harmless:
   // applyCv() pins the duty at 1023 and trim saturates at +TRIM_MAX.
   float lo = TAB_V0, hi = cfg.vCeil;
-  if (v < lo) v = lo;
-  if (v > hi) v = hi;
+  if (v < lo) { v = lo; Serial.println(F("note: clamped to the 2.0 V floor")); }
+  if (v > hi) { v = hi; Serial.println(F("note: clamped to vCeil")); }
   v = floor(v * 100.0f + 0.5f) / 100.0f;
   if (fabs(v - vSet) < 0.001f) return;
   // v0.6.5: no more trim zeroing on big jumps. It was a pre-vRamp relic that
@@ -698,6 +721,7 @@ static void psuOff() {
 }
 static void safeOutputs() {
   openSwitch();
+  cvWho = "safe";
   setCvDuty(1023);
   setCcDuty(0);
 }
@@ -889,6 +913,7 @@ static void trimTask() {
 // open-loop baseline. No load allowed: load sag must stay with the servo,
 // not be baked into the table. Runs as a state machine from the 10 Hz loop,
 // so the display, serial and the trim servo stay alive during the sweep.
+static uint8_t calTmo = 0;              // v0.7.4: consecutive settle timeouts
 static void calStart() {
   if (calRun) return;
   if (fault) { Serial.println(F("refused: clear the fault first")); return; }
@@ -914,6 +939,7 @@ static void calStart() {
   tabValid = false;
   { TabCfg t; t.magic = 0; EEPROM.put(TAB_ADDR, t); }
   calIdx = 0; calWinT = 0; calPtT = millis();
+  calTmo = 0;
   calRun = true;
   Serial.println(F("cal tab: sweep 2.0..14.5 V, keep the load disconnected"));
 }
@@ -935,18 +961,33 @@ static void calTask() {
   bool timeout = millis() - calPtT > 8000UL;
   if (calWinT < 600 && !timeout) return;
   if (timeout && calWinT < 600) {
+    calTmo++;
     Serial.print(F("cal: settle timeout at ")); Serial.print(target, 1);
-    Serial.println(F(" V, recording best effort"));
+    Serial.print(F(" V ("));
+    Serial.print(calTmo);
+    Serial.println(F("/3), point NOT recorded"));
+    if (calTmo >= 3) {
+      Serial.println(F("cal: too many timeouts - sweep aborted, table left INVALID"));
+      calAbort();
+      return;
+    }
+    // v0.7.4: skipped point gets the linear-map estimate (same source the live
+    // demand uses), never a timeout-stuck duty - the old code recorded the
+    // half-broken duty and stamped the garbage table VALID.
+    tab[calIdx] = cvVoltsToDuty(target);
+    if (calIdx > 0 && tab[calIdx] > tab[calIdx - 1]) tab[calIdx] = tab[calIdx - 1];
+  } else {
+    calTmo = 0;
+    // converged duty = the baseline actually applied (table or linear map)
+    // plus the trim that fixed it
+    uint16_t rec = (uint16_t)(tabDuty(target) + trim + 0.5f);
+    if (rec < 1) rec = 1;
+    if (rec > 1023) rec = 1023;
+    if (calIdx > 0 && rec > tab[calIdx - 1]) rec = tab[calIdx - 1];   // duty falls as V rises
+    tab[calIdx] = rec;
+    Serial.print(F("cal ")); Serial.print(target, 1);
+    Serial.print(F(" V -> duty ")); Serial.println(rec);
   }
-  // converged duty = the baseline actually applied (table or linear map)
-  // plus the trim that fixed it
-  uint16_t rec = (uint16_t)(tabDuty(target) + trim + 0.5f);
-  if (rec < 1) rec = 1;
-  if (rec > 1023) rec = 1023;
-  if (calIdx > 0 && rec > tab[calIdx - 1]) rec = tab[calIdx - 1];   // duty falls as V rises
-  tab[calIdx] = rec;
-  Serial.print(F("cal ")); Serial.print(target, 1);
-  Serial.print(F(" V -> duty ")); Serial.println(rec);
   calIdx++; calWinT = 0; calPtT = millis();
   if (calIdx >= TAB_N) {
     tabValid = true;
@@ -1103,12 +1144,15 @@ static void printStatus() {
   Serial.print(F(" I=")); Serial.print(ibat, 2);
   Serial.print(F(" mode=")); Serial.print(!swState ? F("-") : (inCurrentLimit() ? F("CC") : F("CV")));
   Serial.print(F(" cv=")); Serial.print(cvDuty);
+  Serial.print(F(" cvW=")); Serial.print(cvWho);
+  Serial.print(F(" cvN=")); Serial.print(cvWn);
   Serial.print(F(" trim=")); Serial.print(trim, 1);
   Serial.print(F(" tg=")); Serial.print(trimGood, 1);
   Serial.print(F(" cc=")); Serial.print(ccDuty);
   Serial.print(F(" vr=")); Serial.print(vRamp, 2);      // v0.7.3: demand ramp
   Serial.print(F(" tab=")); Serial.print(tabValid ? 1 : 0);
   Serial.print(F(" ceil=")); Serial.print(cfg.vCeil, 1);
+  Serial.print(F(" sl=")); Serial.print(cfg.vSlew, 2);
   Serial.print(F(" vEst=")); Serial.print(vEst, 2);
   Serial.print(F(" Tb=")); Serial.print(tBat, 1);
   Serial.print(F(" Th=")); Serial.print(tHeat, 1);
@@ -1333,6 +1377,7 @@ void setup() {
   pinMode(PIN_FAN, OUTPUT);    digitalWrite(PIN_FAN, LOW);
   pinMode(PIN_BEEP, OUTPUT);   digitalWrite(PIN_BEEP, LOW);
   pwmInit();
+  cvWho = "boot";
   setCvDuty(1023);                // minimum voltage until the settings are loaded
   setCcDuty(0);                   // minimum current limit
 
@@ -1398,7 +1443,7 @@ void loop() {
         vRamp += cfg.vSlew * dt;
         if (vRamp > vSet) vRamp = vSet;
         applyCv();
-      } else vRamp = vSet;
+      } else { vRamp = vSet; applyCv(); }   // v0.7.4: instant jump must refresh the demand too
     } else if (vRamp > vSet) {
       vRamp = vSet;
       applyCv();                       // v0.6.5: react to a lower target at once
