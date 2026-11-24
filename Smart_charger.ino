@@ -1,4 +1,22 @@
 // =====================================================================
+// Bench power supply firmware v0.7.2  (based on v0.7.1)
+// v0.7.2: SELF-HEALING CALIBRATION + UPDATED CHAIN MODEL.
+//         Bench after the CV chain mod (SS34 + R14 220R, stronger
+//         injection): the output sat at 0.29 V at EVERY setpoint. Cause -
+//         a deadlock: a stale/corrupt table (stamped by an earlier cal
+//         run while the chain was broken) is also read by dMin, the v0.5.2
+//         safety ceiling in applyCv(), so the demand pinned at ~1023; a
+//         re-run could not fix it because dMin kept the duty pinned through
+//         the whole sweep and every point timed out back into the table.
+//         Fixes:
+//         1. calStart() now invalidates the table (tabValid=false, magic
+//            erased in EEPROM) before the sweep - tabDuty falls back to the
+//            linear map, the sweep converges and rewrites the table. A reset
+//            mid-sweep no longer resurrects the garbage.
+//         2. Linear map constants match the strengthened chain: R 1030 ->
+//            780 ohm (R14 220 + R12 560), lump 1.9 -> 1.6 V (1.25 FB +
+//            ~0.35 SS34). The open-loop fallback is close again, trim only
+//            mops up the residual.
 // Bench power supply firmware v0.7.1  (based on v0.7.0)
 // v0.7.1: ABSOLUTE SETPOINT FLOOR. setV() refused any target below the
 //         linear model's full-injection voltage (cvDutyToVolts(1023)+0.1
@@ -244,7 +262,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.7.1"
+#define FW_VERSION "PSU 0.7.2"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -498,16 +516,21 @@ static void setCcDuty(uint16_t d) {
 }
 
 // mappings (open loop, from the design calculations)
+// v0.7.2: chain constants updated to the strengthened CV injection path
+// (SS34 instead of 1N4007, R14 470 -> 220 ohm): total series R 1030 -> 780,
+// diode+FB lump 1.9 -> 1.6 V (1.25 FB + ~0.35 Schottky).
+#define CV_R_SERIES 780.0f
+#define CV_V_LUMP   1.60f
 static float cvDutyToVolts(uint16_t d) {
   float vn = 5.0f * d / 1023.0f;
-  float inj = (vn - 1.9f) / 1030.0f;
+  float inj = (vn - CV_V_LUMP) / CV_R_SERIES;
   if (inj < 0) inj = 0;
   return cfg.vCeil - 3900.0f * inj;
 }
 static uint16_t cvVoltsToDuty(float v) {
   float inj = (cfg.vCeil - v) / 3900.0f;
   if (inj <= 0) return 0;
-  float d = (1.9f + 1030.0f * inj) / 5.0f;
+  float d = (CV_V_LUMP + CV_R_SERIES * inj) / 5.0f;
   if (d > 1.0f) d = 1.0f;
   return (uint16_t)(d * 1023.0f + 0.5f);
 }
@@ -865,6 +888,16 @@ static void calStart() {
   }
   calVSetSaved = vSet;
   calWasTrim = trimEnabled; trimEnabled = true;
+  // v0.7.2: drop any previous table BEFORE the sweep. A stale or corrupt
+  // table poisons dMin too (the v0.5.2 safety ceiling reads tabDuty), which
+  // pins the demand duty at ~1023 - the sweep then times out at every point
+  // and re-stamps the same garbage forever (bench: 0.29 V at any setpoint
+  // after the CV chain mod). Invalidating first makes tabDuty fall back to
+  // the linear map, so the sweep starts from a sane demand and can actually
+  // converge. Erasing the magic in EEPROM also protects against a reset
+  // mid-sweep resurrecting the bad table.
+  tabValid = false;
+  { TabCfg t; t.magic = 0; EEPROM.put(TAB_ADDR, t); }
   calIdx = 0; calWinT = 0; calPtT = millis();
   calRun = true;
   Serial.println(F("cal tab: sweep 2.0..14.5 V, keep the load disconnected"));
