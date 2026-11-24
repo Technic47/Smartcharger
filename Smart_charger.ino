@@ -1,4 +1,12 @@
 // =====================================================================
+// Bench power supply firmware v0.7.5  (based on v0.7.4)
+// v0.7.5: applyCv INPUT RING. The v0.7.4 trace caught applyCv itself
+//         writing cvDuty=1023 with st showing vr=12.00, trim=0.0, tab=1,
+//         ceil=14.9 and cvN too small for a full 5->12 V ramp - all
+//         supposedly impossible with a healthy table. Guessing ends here:
+//         the last 10 applyCv calls are recorded (vRamp, baseline b, trim,
+//         result d) and dumped by the new "cvdump" command. The numbers
+//         will show which input is lying.
 // Bench power supply firmware v0.7.4  (based on v0.7.3)
 // v0.7.4: CV DEMAND TRACE + THREE REAL BUGFIXES.
 //         Bench: Vset=12, healthy table (tabDuty(12)=326, trim=-20), yet
@@ -297,7 +305,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.7.4"
+#define FW_VERSION "PSU 0.7.5"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -472,6 +480,11 @@ static uint32_t tSpChange = 0;
 static uint16_t cvDuty = 1023;
 static const char* cvWho = "boot";      // v0.7.4: last CV duty writer (st: cvW=)
 static uint16_t    cvWn  = 0;           // v0.7.4: CV duty write counter (st: cvN=)
+// v0.7.5: ring of the last applyCv inputs, dumped by "cvdump"
+#define CV_TRACE_N 10
+static float   cvT_vr[CV_TRACE_N]; static uint16_t cvT_b[CV_TRACE_N];
+static float   cvT_tr[CV_TRACE_N]; static uint16_t cvT_d[CV_TRACE_N];
+static uint8_t cvT_i = 0;
 static uint16_t ccDuty = 1023;
 static float    ccInt = 0;              // v0.6.0: CC PI integrator (counts)
 static uint32_t tCcManual = 0;          // v0.6.0: 'cc N' freezes the PI until this time
@@ -626,6 +639,9 @@ static void applyCv() {
   if (d < 1.0f) d = 1.0f;
   if (d > 1023.0f) d = 1023.0f;
   cvWho = "applyCv";
+  cvT_vr[cvT_i] = vRamp; cvT_b[cvT_i] = b; cvT_tr[cvT_i] = trim;
+  cvT_d[cvT_i] = (uint16_t)(d + 0.5f);
+  cvT_i = (cvT_i + 1) % CV_TRACE_N;
   setCvDuty((uint16_t)(d + 0.5f));
 }
 static void applyCc() {
@@ -1177,6 +1193,20 @@ static void execCmd(char* s) {
   if (!strcmp(cmd, "st")) { printStatus(); return; }
   if (!strcmp(cmd, "log")) { logOn = a1 && atoi(a1); Serial.println(logOn ? F("log on") : F("log off")); return; }
   if (!strcmp(cmd, "off")) { psuOff(); printStatus(); return; }
+  if (!strcmp(cmd, "cvdump")) {                       // v0.7.5: applyCv input ring
+    Serial.print(F("cvWho=")); Serial.println(cvWho);
+    Serial.print(F("cvN=")); Serial.println(cvWn);
+    for (uint8_t k = 0; k < CV_TRACE_N; k++) {
+      uint8_t j = (cvT_i + k) % CV_TRACE_N;
+      Serial.print(F("["));
+      if (k < 10) Serial.print(k);
+      Serial.print(F("] vr=")); Serial.print(cvT_vr[j], 2);
+      Serial.print(F(" b=")); Serial.print(cvT_b[j]);
+      Serial.print(F(" trim=")); Serial.print(cvT_tr[j], 1);
+      Serial.print(F(" d=")); Serial.println(cvT_d[j]);
+    }
+    return;
+  }
   if (!strcmp(cmd, "kill")) { safeOutputs(); Serial.println(F("output off, PWM at safe values (v/i or clr restores)")); return; }
   if (!strcmp(cmd, "on")) { psuOn(a1 && !strcmp(a1, "force")); printStatus(); return; }
   if (!strcmp(cmd, "clr")) { clearFault(); return; }
