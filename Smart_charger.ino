@@ -1,4 +1,19 @@
 // =====================================================================
+// Bench power supply firmware v0.7.3  (based on v0.7.2)
+// v0.7.3: DIAGNOSTICS FOR THE STUCK cv=1023 STATE (no logic changes).
+//         Bench after flashing v0.7.2 + running "cal tab": during the sweep
+//         points above ~7 V fell short by ~0.2 V, and after the sweep the
+//         output froze at ~1.3 V with cv=1023 regardless of setpoint,
+//         trim=0.0, fault=none - contradictory: after a v0.7.2 sweep the
+//         table mathematically cannot contain 1023 (entries = map+trim,
+//         trim <= +-120, map(8V) ~= 650 at vCeil 14.9).
+//         Instrumentation:
+//         1. printStatus() gains vr= (vRamp), tab= (tabValid 0/1),
+//            ceil= (cfg.vCeil) - tells which leg applyCv() is on and what
+//            the ceiling claims to be.
+//         2. "cal dump" prints tabValid and all 26 table entries
+//            (voltage -> duty) - exposes a corrupt/stale table directly.
+//         These two prints decide the fix branch without guessing.
 // Bench power supply firmware v0.7.2  (based on v0.7.1)
 // v0.7.2: SELF-HEALING CALIBRATION + UPDATED CHAIN MODEL.
 //         Bench after the CV chain mod (SS34 + R14 220R, stronger
@@ -262,7 +277,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.7.2"
+#define FW_VERSION "PSU 0.7.3"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -1091,6 +1106,9 @@ static void printStatus() {
   Serial.print(F(" trim=")); Serial.print(trim, 1);
   Serial.print(F(" tg=")); Serial.print(trimGood, 1);
   Serial.print(F(" cc=")); Serial.print(ccDuty);
+  Serial.print(F(" vr=")); Serial.print(vRamp, 2);      // v0.7.3: demand ramp
+  Serial.print(F(" tab=")); Serial.print(tabValid ? 1 : 0);
+  Serial.print(F(" ceil=")); Serial.print(cfg.vCeil, 1);
   Serial.print(F(" vEst=")); Serial.print(vEst, 2);
   Serial.print(F(" Tb=")); Serial.print(tBat, 1);
   Serial.print(F(" Th=")); Serial.print(tHeat, 1);
@@ -1212,6 +1230,15 @@ static void execCmd(char* s) {
 
   if (!strcmp(cmd, "cal") && a1) {
     if (!strcmp(a1, "tab")) { calStart(); return; }     // v0.7.0: sweep calibration
+    if (!strcmp(a1, "dump")) {                        // v0.7.3: table diagnostics
+      Serial.print(F("tabValid=")); Serial.println(tabValid ? 1 : 0);
+      for (uint8_t i = 0; i < TAB_N; i++) {
+        Serial.print(F("tab[")); Serial.print(i);
+        Serial.print(F("] ")); Serial.print(TAB_V0 + i * TAB_STEP, 1);
+        Serial.print(F(" V -> ")); Serial.println(tab[i]);
+      }
+      return;
+    }
     if (!a2) return;
     float val = atof(a2);
     float vnode = fVc * VREF / 1023.0f;
