@@ -1,3 +1,4 @@
+// Bench power supply firmware v0.7.7  (based on v0.7.6)
 // =====================================================================
 // Bench power supply firmware v0.7.6  (based on v0.7.5)
 // v0.7.6: CORRUPTION BISECTION. The v0.7.5 ring caught tabDuty returning
@@ -315,7 +316,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.7.6"
+#define FW_VERSION "PSU 0.7.7"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -337,26 +338,28 @@
 // ---------------- hardware constants ----------------
 #define VREF            5.0f       // ADC reference, absorbed by calibration
 #define R_SERIES        0.014f     // switch + wires in negative lead, ohm
-#define I_SIGN_DEFAULT 1.0f     // default sensor direction; flip at runtime with "isign -1"
+#define I_SIGN_DEFAULT  1.0f     // default sensor direction; flip at runtime with "isign -1"
 #define ENC_PULSES      4          // transitions per detent
 #define ENC_DIR         1          // set -1 to reverse rotation
 
 #define NTC_PULLUP      4700.0f    // pull-up on the board
 #define NTC_R25         100000.0f
 #define NTC_BETA        3950.0f
+#define CV_R_FB         4270.0f   // верхнее плечо делителя FB
 
 // ---------------- limits ----------------
-#define V_FAULT         16.0f      // hard overvoltage trip (module ceiling is ~15 V)
+#define V_FAULT         25.0f      // hard overvoltage trip (module ceiling is ~15 V)
 #define I_FAULT         12.0f
 #define T_BAT_MAX       50.0f      // only if the 'battery' NTC is connected
 #define T_HEAT_MAX      80.0f
 #define T_INT_MAX       75.0f
+#define V_BATT_FAULT    15.3f
 
 #define I_MIN_SET       0.10f      // lowest current limit you can set
 #define READY_BAND      0.3f       // ON allowed when Vout <= Vset + this
 #define TRIM_WHEN_OFF   1          // 1 = output switch (IRLB3034 pair) installed: V is valid when OFF, trim runs when OFF too
 #define OUT_TAU_MS      9000.0f    // output discharge time constant (model, used with 'faults 0')
-#define TRIM_MAX        120.0f     // trim authority in PWM counts (~2.3 V)
+#define TRIM_MAX        1000.0f     // trim authority in PWM counts (~2.3 V)
 #define VSET_GUARD      0.15f      // CV demand never exceeds vSet + this (safety ceiling)
 #define CC_CV_MARGIN    0.20f      // in CC the CV demand tracks vbat + this (<= vSet)
 
@@ -435,9 +438,9 @@ static float iLimit() { return cfg.iMax < cfg.iCeil ? cfg.iMax : cfg.iCeil; }
 static uint16_t cvVoltsToDuty(float v);   // defined with the mappings below
 // Piecewise-linear duty-vs-voltage curve measured on THIS unit: replaces the
 // open-loop linear map as the CV baseline; trim only mops up the residuals.
-#define TAB_V0    2.0f
+#define TAB_V0    2.5f
 #define TAB_STEP  0.5f
-#define TAB_N     26                 // 2.0 .. 14.5 V
+#define TAB_N     26                 // 2.0 .. 15 V
 #define TAB_MAGIC 0x7AB1
 #define TAB_ADDR  128                // Cfg @0, Sp @64, table @128
 struct TabCfg { uint16_t magic; uint16_t d[TAB_N]; };
@@ -471,6 +474,11 @@ static uint16_t tabDuty(float v) {
   if (f < 0) f = 0;
   if (f > 1) f = 1;
   float d = tab[i] + (tab[i + 1] - tab[i]) * f;
+  
+  // --- НАЧАЛО ЗАЩИТЫ ---
+  if (d < 0 || d > 1023) return cvVoltsToDuty(v); // Если в таблице мусор, берем линейную карту
+  // --- КОНЕЦ ЗАЩИТЫ ---
+  
   return (uint16_t)(d + 0.5f);
 }
 
@@ -587,10 +595,10 @@ static float cvDutyToVolts(uint16_t d) {
   float vn = 5.0f * d / 1023.0f;
   float inj = (vn - CV_V_LUMP) / CV_R_SERIES;
   if (inj < 0) inj = 0;
-  return cfg.vCeil - 3900.0f * inj;
+  return cfg.vCeil - CV_R_FB * inj;
 }
 static uint16_t cvVoltsToDuty(float v) {
-  float inj = (cfg.vCeil - v) / 3900.0f;
+  float inj = (cfg.vCeil - v) / CV_R_FB;
   if (inj <= 0) return 0;
   float d = (CV_V_LUMP + CV_R_SERIES * inj) / 5.0f;
   if (d > 1.0f) d = 1.0f;
@@ -640,13 +648,15 @@ static void beepTask() {
 // ---------------- setpoints -> PWM ----------------
 static void applyCv() {
   if (fault) return;
-  uint16_t b = tabDuty(vRamp);                       // v0.7.0: calibrated baseline
-  if (b == 0) { cvWho = "applyCv"; setCvDuty(0); return; }   // at the ceiling, no injection
+  uint16_t b = tabDuty(vRamp);                       
+  if (b == 0) { cvWho = "applyCv"; setCvDuty(0); return; }   
   float d = (float)b + trim;
-  // Absolute ceiling: the demand must never exceed the (ramped) set value
-  // + VSET_GUARD, regardless of trim state (v0.5.2). Duty is inverted: a smaller duty
-  // means a higher demanded voltage, so clamp from below.
   uint16_t dMin = tabDuty(vRamp + VSET_GUARD);
+  
+  // --- НАЧАЛО ЗАЩИТЫ ---
+  if (dMin > 1023) dMin = 1023; // Защита от мусорного dMin
+  // --- КОНЕЦ ЗАЩИТЫ ---
+
   if (d < (float)dMin) d = (float)dMin;
   if (d < 1.0f) d = 1.0f;
   if (d > 1023.0f) d = 1023.0f;
@@ -805,6 +815,7 @@ static void measure() {
 
   if (!fault) {
     if (checksOn && vbat > V_FAULT) trip("OVERVOLT");
+    else if (checksOn && swState && vbat > V_BATT_FAULT) trip("BATT OVERVOLT");
     else if (checksOn && fabs(ibat) > I_FAULT) trip("OVERCURRENT");
     else if (!isnan(tBat)  && tBat  > T_BAT_MAX)  trip("BATTERY HOT");
     else if (!isnan(tHeat) && tHeat > T_HEAT_MAX) trip("HEATSINK HOT");
@@ -988,24 +999,20 @@ static void calTask() {
   if (fabs(vbat - target) < 0.03f) {
     if (calWinT < 600) calWinT += 100;
   } else calWinT = 0;
-  bool timeout = millis() - calPtT > 8000UL;
+  bool timeout = millis() - calPtT > 15000UL;
   if (calWinT < 600 && !timeout) return;
   if (timeout && calWinT < 600) {
     calTmo++;
     Serial.print(F("cal: settle timeout at ")); Serial.print(target, 1);
-    Serial.print(F(" V ("));
-    Serial.print(calTmo);
-    Serial.println(F("/3), point NOT recorded"));
+    Serial.print(F(" V (")); Serial.print(calTmo); Serial.println(F("/3), point NOT recorded"));
     if (calTmo >= 3) {
       Serial.println(F("cal: too many timeouts - sweep aborted, table left INVALID"));
       calAbort();
       return;
     }
-    // v0.7.4: skipped point gets the linear-map estimate (same source the live
-    // demand uses), never a timeout-stuck duty - the old code recorded the
-    // half-broken duty and stamped the garbage table VALID.
-    tab[calIdx] = cvVoltsToDuty(target);
-    if (calIdx > 0 && tab[calIdx] > tab[calIdx - 1]) tab[calIdx] = tab[calIdx - 1];
+    // Пропускаем точку: берем предыдущее значение, чтобы таблица была плавной
+    if (calIdx > 0) tab[calIdx] = tab[calIdx - 1];
+    else tab[calIdx] = cvVoltsToDuty(target);
   } else {
     calTmo = 0;
     // converged duty = the baseline actually applied (table or linear map)
@@ -1025,7 +1032,13 @@ static void calTask() {
     calRun = false;
     vSet = calVSetSaved; vRamp = vSet;
     trimEnabled = calWasTrim;
-    applyCv();
+    
+    // --- НАЧАЛО ВСТАВКИ ---
+    trim = 0;       // ОБЯЗАТЕЛЬНО: сбрасываем коррекцию, иначе выход упадет в 0
+    trimGood = 0;
+    // --- КОНЕЦ ВСТАВКИ ---
+
+    applyCv();      // Теперь применится чистая таблица без остатков старого trim
     if (calWasOff) psuOff();
     beep(2, 80, 80);
     Serial.println(F("cal tab done, table saved"));
@@ -1493,6 +1506,8 @@ void loop() {
       } else { vRamp = vSet; applyCv(); }   // v0.7.4: instant jump must refresh the demand too
     } else if (vRamp > vSet) {
       vRamp = vSet;
+      trim = 0; // <-- ДОБАВИТЬ ЭТО
+      trimGood = 0; // <-- И ЭТО
       applyCv();                       // v0.6.5: react to a lower target at once
     }
     updateFan();
