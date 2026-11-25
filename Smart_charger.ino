@@ -1,312 +1,14 @@
-// Bench power supply firmware v0.7.7  (based on v0.7.6)
+// Bench power supply firmware v0.8.0  (based on v0.7.7)
 // =====================================================================
-// Bench power supply firmware v0.7.6  (based on v0.7.5)
-// v0.7.6: CORRUPTION BISECTION. The v0.7.5 ring caught tabDuty returning
-//         duty values outside its mathematical clamp range (b up to 61831)
-//         in 9 of 10 slots, with the garbage forming an arithmetic
-//         progression - classic signature of foreign float bytes landing
-//         on the uint16 arrays. The ring gains dMin and a live tab[20]
-//         snapshot; the new "draw 0/1" command freezes the display update.
-//         Bisection plan: v 12 -> cvdump (expect garbage), then "draw 0",
-//         v 5, v 12, cvdump - if the slots come out clean, the corruption
-//         source lives in the draw path (u8g2 / dtostrf formatting).
-// Bench power supply firmware v0.7.5  (based on v0.7.4)
-// v0.7.5: applyCv INPUT RING. The v0.7.4 trace caught applyCv itself
-//         writing cvDuty=1023 with st showing vr=12.00, trim=0.0, tab=1,
-//         ceil=14.9 and cvN too small for a full 5->12 V ramp - all
-//         supposedly impossible with a healthy table. Guessing ends here:
-//         the last 10 applyCv calls are recorded (vRamp, baseline b, trim,
-//         result d) and dumped by the new "cvdump" command. The numbers
-//         will show which input is lying.
-// Bench power supply firmware v0.7.4  (based on v0.7.3)
-// v0.7.4: CV DEMAND TRACE + THREE REAL BUGFIXES.
-//         Bench: Vset=12, healthy table (tabDuty(12)=326, trim=-20), yet
-//         cvDuty sat at 1023 - mathematically impossible via applyCv, and
-//         no applyCv call path explained it. st gains cvW= (last duty
-//         writer: boot/applyCv/safe) + cvN= (write counter) + sl= (vSlew)
-//         to catch the culprit red-handed instead of guessing.
-//         Fixes:
-//         1. Ramp: the vslew==0 ("instant") branch set vRamp but forgot
-//            applyCv() - after such a jump the demand was never refreshed,
-//            the output froze at the old demand (bench: "only the cal
-//            sweep regulates, normal setpoints do nothing").
-//         2. cal tab: a settle-timeout point was recorded into the table
-//            anyway ("best effort") - a sweep over a broken chain stamped
-//            a VALID table full of 1023s. Now a timed-out point is skipped
-//            (the slot gets the linear-map estimate) and >=3 timeouts
-//            abort the sweep, leaving the table INVALID (linear fallback).
-//         3. setV() was silent when the setpoint got clamped to [2.0,
-//            vCeil] - "v 12" that silently becomes Vset=2.00 now prints a
-//            note.
-// Bench power supply firmware v0.7.3  (based on v0.7.2)
-// v0.7.3: DIAGNOSTICS FOR THE STUCK cv=1023 STATE (no logic changes).
-//         Bench after flashing v0.7.2 + running "cal tab": during the sweep
-//         points above ~7 V fell short by ~0.2 V, and after the sweep the
-//         output froze at ~1.3 V with cv=1023 regardless of setpoint,
-//         trim=0.0, fault=none - contradictory: after a v0.7.2 sweep the
-//         table mathematically cannot contain 1023 (entries = map+trim,
-//         trim <= +-120, map(8V) ~= 650 at vCeil 14.9).
-//         Instrumentation:
-//         1. printStatus() gains vr= (vRamp), tab= (tabValid 0/1),
-//            ceil= (cfg.vCeil) - tells which leg applyCv() is on and what
-//            the ceiling claims to be.
-//         2. "cal dump" prints tabValid and all 26 table entries
-//            (voltage -> duty) - exposes a corrupt/stale table directly.
-//         These two prints decide the fix branch without guessing.
-// Bench power supply firmware v0.7.2  (based on v0.7.1)
-// v0.7.2: SELF-HEALING CALIBRATION + UPDATED CHAIN MODEL.
-//         Bench after the CV chain mod (SS34 + R14 220R, stronger
-//         injection): the output sat at 0.29 V at EVERY setpoint. Cause -
-//         a deadlock: a stale/corrupt table (stamped by an earlier cal
-//         run while the chain was broken) is also read by dMin, the v0.5.2
-//         safety ceiling in applyCv(), so the demand pinned at ~1023; a
-//         re-run could not fix it because dMin kept the duty pinned through
-//         the whole sweep and every point timed out back into the table.
-//         Fixes:
-//         1. calStart() now invalidates the table (tabValid=false, magic
-//            erased in EEPROM) before the sweep - tabDuty falls back to the
-//            linear map, the sweep converges and rewrites the table. A reset
-//            mid-sweep no longer resurrects the garbage.
-//         2. Linear map constants match the strengthened chain: R 1030 ->
-//            780 ohm (R14 220 + R12 560), lump 1.9 -> 1.6 V (1.25 FB +
-//            ~0.35 SS34). The open-loop fallback is close again, trim only
-//            mops up the residual.
-// Bench power supply firmware v0.7.1  (based on v0.7.0)
-// v0.7.1: ABSOLUTE SETPOINT FLOOR. setV() refused any target below the
-//         linear model's full-injection voltage (cvDutyToVolts(1023)+0.1
-//         = vCeil - 11.74 + 0.1), so the lowest settable output was
-//         ~3.3-4.0 V depending on vCeil - "v 2" snapped to ~4 V. Now the
-//         floor is 2.0 V (= table bottom TAB_V0). Demanding below the
-//         injection ceiling is safe: the duty pins at 1023 and trim just
-//         saturates at +TRIM_MAX. The cal sweep always set vSet directly
-//         and was unaffected.
-// Bench power supply firmware v0.7.0  (based on v0.6.5)
-// v0.7.0: PER-UNIT CV DUTY TABLE + ON-DEVICE CALIBRATION.
-//         The linear open-loop map cvVoltsToDuty() starts a hair off on
-//         every unit, so the CV loop always begins away from the target
-//         and trim (2 Hz, few counts/tick) crawls it in - the slow
-//         approach and the occasional demand-vs-output mismatch. Now:
-//         1. EEPROM table @128 (TabCfg, magic 0x7AB1): 26 points, 2.0 V
-//            ..14.5 V step 0.5 V, measured duty for THIS unit. Loaded at
-//            boot; applyCv() interpolates piecewise-linearly between
-//            points. Falls back to the linear map while the table is
-//            empty - so the unit always runs.
-//         2. Calibration, no PC/tools needed: serial "cal tab" or the
-//            encoder UI (field 4 "V TABLE CAL", long press). Runs all 26
-//            points unattended (~30-90 s): sets the point, waits for the
-//            CV loop to settle inside +/-30 mV (or 8 s timeout), records
-//            the live duty. Requires NO load (refuses above ~0.15 A) and
-//            a working trim loop. Long press during the run aborts and
-//            restores the previous setpoint. Table is written to EEPROM
-//            at the end; "defaults" does NOT clear it on purpose.
-//         Bench: after cal tab the setpoint lands within one trim tick
-//         of the target at every point - the ~1 s post-setpoint creep is
-//         gone. Re-run cal tab after flux cleaning / conformal coat.
-// Bench power supply firmware v0.6.5  (based on v0.6.4)
-// v0.6.5: SETPOINT-CHANGE DEAD TIME + TRIM WIPE REMOVED.
-//         Bench: "v 5" -> "v 10" stalled at 5.9 V; then "v 7" jumped the
-//         output to 10.5 V and crept down. Two pre-vRamp relics caused it:
-//         1. setV() zeroed trim on any jump > 2 V - wiping the CV loop's
-//            only memory; with trim parked at -TRIM_MAX the demand leapt
-//            ~+2.3 V and the output flew past the target.
-//         2. trimTask froze for 3 s after EVERY setpoint change
-//            (tSetChange) - the "does nothing for ~5 s, then dumps" dead
-//            time on a lower target. Now: trim zeroing is gone, and the
-//            freeze applies only for 3 s after the output switch-on
-//            (inrush). Downward jumps rewrite the demand immediately.
-// Bench power supply firmware v0.6.4  (based on v0.6.3)
-// v0.6.4: OVERSHOOT FIX. vslew alone did not remove the overshoot: the CV
-//         injection cap C4 (100 uF) discharges through R13 (100k) with a
-//         ~10 s time constant, so the FB injection lingers after the
-//         demand drops and the output sails above the target while trim
-//         crawls back at 3 counts/tick. Two measures:
-//         1. hardware: C4 100uF -> 10uF (discharge ~1 s). Also speeds up
-//            the post-CC voltage recovery by an order of magnitude.
-//         2. runtime trim rates, no reflash: "vdown [n]" (pull-down,
-//            counts/tick, default 8, was 3) and "vup [n]" (rise rate,
-//            default 20). EEPROM via "save".
-// Bench power supply firmware v0.6.3  (based on v0.6.2)
-// v0.6.3: RUNTIME TUNING, no reflash needed:
-//         - "ccpi [KP KI]"  - CC PI gains (EEPROM; KP 10..1000, KI 10..5000).
-//           Bench: the current took 5-10 s to reach the setpoint with the
-//           compiled-in 150/300; try 300/600 first.
-//         - "vslew [V/s]"   - voltage demand up-ramp (0 = instant, default 2).
-//           The open-loop duty map always started a hair HIGH, so a new
-//           voltage overshot the setpoint and trim crawled it down at
-//           2 Hz (up to 3 counts/tick). Now an internal vRamp chases
-//           vSet from below at vslew and applyCv()/trimTask regulate to
-//           vRamp - the output approaches the target without overshoot.
-//           Downward jumps stay instant (the output falls at its physical
-//           rate anyway).
-// Bench power supply firmware v0.6.2  (based on v0.6.1)
-// v0.6.2: CC PI SIGN FIX. The error was computed as (iSet - ibat) while
-//         the duty is injected proportionally - so the loop drove the
-//         injection to max whenever the measured current was BELOW Iset
-//         and to zero when above it. Bench signature of the bug: the
-//         output collapsed to ~3-5 V right at switch-on, and LOWERING
-//         Iset made the voltage recover (user called it correctly:
-//         "CC logic looks inverted"). Also clamp ccInt to [0, 1023]:
-//         the unbounded integrator wound far below zero and took
-//         minutes to come back after a satLo episode.
-// Bench power supply firmware v0.6.1  (based on v0.6.0)
-// v0.6.1: current sensor direction is runtime-configurable: "isign [-1|1]"
-//         (stored in EEPROM, survives reflashes). Bench finding on the
-//         new power board: a flipped ACS712 makes ibat negative, the PI
-//         then sees current far below Iset and pins the injection at
-//         1023 - the output collapses and lowering Iset only relaxes the
-//         collapse. Sign is now a command, not a recompile.
-// Bench power supply firmware v0.6.0  (based on v0.5.5)
-// v0.6.0: DIGITAL CC LOOP (new power board, LM358 analog servo removed).
-//         The CC chain is now D44 -> 10k -> (1uF || 100k) -> 560R -> diode
-//         into the FB node; current is measured by ACS712-20A on A10 (no
-//         shunt, no W signal). A PI controller (ccPiTask, 10 Hz) drives
-//         ccDuty straight from the current error, so the limit no longer
-//         depends on the output voltage or on cal lim / ceil i mapping
-//         calibration - accuracy = ACS712 accuracy. CV-trim logic and the
-//         v0.5.2 absolute ceiling (demand <= vSet + VSET_GUARD) are kept:
-//         in CC the CV demand self-zeros its injection, the two loops
-//         complement instead of fighting, so the old arbitration latch
-//         moves to a simple ccDuty hysteresis (enter > 40, exit < 15).
-//         Set CC_PI to 0 to fall back to the v0.5.5 analog-map behaviour.
-// Bench power supply firmware v0.5.5  (based on v0.5.4)
-// v0.5.5: the v0.5.4 relax SNAP became a FAST SLEW (30 counts/tick).
-//         The snap crossed the CC/CV mode boundary with one big step into
-//         the FB node; with the hysteresis latch (enter 0.92 / exit 0.80 x
-//         Iset) a current oscillation crossing both thresholds flipped the
-//         mode every cycle and kicked the analog servo into a limit cycle
-//         (bench: Iset=5 A, bolt load: current slowly approached 5 A, then
-//         hunted 3-6 A forever). Slew keeps the boundary transition gentle;
-//         the v0.5.2 ceiling still rules out overshoot, and full recovery
-//         after CC stays ~2 s.
-// Bench power supply firmware v0.5.4  (based on v0.5.3)
-// v0.5.4: the "relax to trimGood" path now SNAPS instead of slewing.
-//         v0.5.3 made it proportional (10%/tick, cap 6 counts @ 2 Hz), which
-//         cut the CC-release recovery from ~1 min to ~10 s, but that is
-//         still a crawl. Overshoot is already impossible: applyCv()
-//         hard-clamps the demand to vSet + VSET_GUARD regardless of trim
-//         (v0.5.2), so trim can jump straight to trimGood - the same move
-//         psuOff() has always done. After releasing CC the output now
-//         recovers at the physical slew rate of the module (~1-2 s).
-// Bench power supply firmware v0.5.3  (based on v0.5.2)
-// v0.5.3: fixed the slow CC dynamics introduced in v0.5.2.
-//         - In CC trim now TRACKS the target directly instead of slewing
-//           4 counts/0.5 s tick: entering CC at a low output parked trim
-//           hundreds of counts away from the target, so the limit took
-//           ~1 min to settle and the current floated above the setpoint
-//           until it arrived.
-//         - The "relax to trimGood" path (loaded, big CV error) is now
-//           proportional (10%/tick, cap 6 counts) instead of a fixed 2
-//           counts/tick: releasing CC after a long low-current limit hands
-//           the output back to CV in seconds, not ~1 min.
-// Bench power supply firmware v0.5.2  (based on v0.5.1)
-// v0.5.2: the set voltage is an ABSOLUTE ceiling - never exceeded, in any
-//         mode. Two changes:
-//         1. applyCv() hard-clamps the CV demand: the effective target is
-//            never higher than vSet + VSET_GUARD (0.15 V), no matter what
-//            trim says. Previously trim parked at -TRIM_MAX in CC, so when
-//            the current limit released, the output jumped ABOVE the set
-//            voltage (toward ~14 V for a 12 V setting) until trim returned.
-//         2. In current limit trim no longer runs to -TRIM_MAX. It now
-//            tracks vbat + CC_CV_MARGIN (0.2 V, capped at vSet): the analog
-//            CC loop gets the minimum injection stress, and releasing the
-//            limit hands over a CV demand already equal to ~the measured
-//            output - no overshoot above vSet at all.
-// Bench power supply firmware v0.5.1  (based on v0.5)
-// v0.5.1: in current limit the trim loop now WITHDRAWS the CV injection
-//         (trim -> -TRIM_MAX, 4 counts per 0.5 s tick) instead of freezing.
-//         With trim frozen the CV chain kept injecting ~0.7-1.3 mA into the
-//         FB node, so the analog CC loop (max ~3.4 mA) could not pull the
-//         output down: measured limit floor was ~2.7 A at iSet 0.1 A with
-//         I_lim ~= 2.7 + 0.55 * iSet. After the fix I_lim = W / Rshunt.
-// Bench power supply firmware v0.5  (based on v0.4.2)
-// v0.5: trim loop no longer winds up under the module current limit.
-//       Bench result: with trim off the supply held 5.8 W, with trim on it slid to 5.2 W and,
-//       after OFF, the no-load output jumped to 8-9 V and came down very slowly.
-//       - "loaded" (I > 0.3 A) and the output more than TRIM_LIMIT_ERR (0.4 V) below the setting
-//         = current limit, not a CV error: trim is frozen and relaxes (2 counts / 0.5 s) back
-//         to trimGood, the last trim value that gave a correct voltage;
-//       - on OFF the trim jumps straight back to trimGood (no-load output returns to the set value);
-//       - without a load, trim goes down (lower voltage) up to 3 counts per step instead of 1;
-//       - "st" shows tg= (trimGood). "trim 0" = off + trim and trimGood reset, "trim 1" = on.
-// Bench power supply firmware v0.4.2  (based on v0.4.1)
-// v0.4.2: fixes the "stuck at 5.4 V" trap. CC is now detected by current only (I > 0.88 x Iset);
-//         the old "voltage far below the setting" rule froze the trim loop under load.
-//         Trim authority 60 -> 120 counts, freeze only when the error exceeds 2.5 V,
-//         trim runs every 0.5 s with bigger steps (up to 20 counts, gain 40 counts/V).
-// Bench power supply firmware v0.4.1  (based on v0.4)
-// v0.4.1: output switch is installed: the voltage trim loop now also runs while the output is
-//         OFF (TRIM_WHEN_OFF), so the output settles to the set value before ON and the
-//         "wait" message does not hang at the open-loop level (e.g. 7.5 V for a 7.0 V setting).
-// Bench power supply firmware v0.4  (based on v0.3)
-// v0.4: imax <A> = separate hard cap for the current SETPOINT (default 8.0 A, saved with
-//       "save"). The CC map (ceil i / cal lim) is not touched by it: the effective maximum is
-//       min(imax, ceil i). Applies to the encoder, "i", "cc" and the stored setpoint.
-// v0.2: CC mode also detected by a low output voltage (limit below the set value),
-//       trim loop is frozen when the error is outside its authority (no wind-up in CC).
-// v0.3: NEW CC reference. D44 drives the module CC pad 2 directly (PWM -> 7.45k -> node,
-//       node: 2.36k to GND + 1..10 uF to GND, pad 2 = node, pad 1 = GND, pad 3 not used,
-//       no 2N7000). Full scale ~1.2 V on pad 2 = highest current limit.
-//       Higher duty = HIGHER limit (v0.2 was inverted). Current limit mapping:
-//         I(duty) = i0 + (iCeil - i0) * duty / 1023
-//       When the output is OFF (and at boot / fault) the duty is 0 = lowest limit (~0.1 A).
-//       New commands: cc <duty 0..1023> (raw CC duty), ceil i0 <A>.
-// Board : MKS Gen v1.4 (ATmega2560, RAMPS 1.4 pinout)
-// LCD   : RepRapDiscount Full Graphic Smart Controller (ST7920, U8g2)
-// Two settings: output voltage and current limit. Output on/off.
-//
-// Library: U8g2 (Library Manager). Board: Arduino Mega 2560.
-//
-// Hardware is the same as in the charger wiring document:
-//   D5   CV PWM  Timer3 OC3A   SERVOS header, column 2.1 (signal pin)
-//   D44  CC PWM  Timer5 OC5C   AUX-2, bottom row, 4th column (-> 7.45k -> CC pad 2)
-//   D40  output switch gate    AUX-2, top row, 3rd column (HIGH = on)
-//   D59 (A5)  output voltage divider 120k/22k   AUX-2, bottom row, 2nd column
-//   D64 (A10) ACS712 VIOUT                       AUX-2, bottom row, 3rd column
-//   D67 (A13) NTC 'battery' (not required)       NTC connector E0
-//   D69 (A15) NTC heatsink                       NTC connector E1
-//   D68 (A14) NTC inside converter               NTC connector BED
-//   D10  fan MOSFET            screw terminal E0 (= supply voltage, 24 V fan)
-//   LCD  EXP1: D16 CS, D17 data, D23 clock, D35 button, D37 beeper, 5V, GND
-//        EXP2: D31, D33 encoder A/B (and GND)
-//
-// How it works
-//   Voltage: open-loop PWM into the module FB, then a slow trim loop (1 Hz)
-//            corrects the duty from the measured output voltage.
-//            Trim works only when the output is ON, sensors are trusted and
-//            the unit is not in current limit.
-//   Current: open-loop PWM into the CC network (no trim). Calibrate once with
-//            'cal lim' (see below).
-//   Buck cannot sink current: after lowering the voltage with no load the
-//            output falls slowly (tau = C x ~4.3k). The unit refuses to switch
-//            ON while the output is more than 0.3 V above the set value
-//            ('wait' on the screen).
-//
-// Encoder
-//   Press       : select V -> I -> info screen -> V
-//   Rotate      : change selected value, 0.05 V / 0.05 A per click (V_STEP, I_STEP)
-//   Long press  : output ON / OFF  (when a fault is latched: clear the fault)
-//   Display reset button = hardware stop (MCU reboots, output OFF).
-//   Boot always starts with the output OFF.
-//
-// Serial 115200 commands (end with Enter):
-//   help | st | log 0/1
-//   v <volts>   set voltage        i <amps>   set current limit
-//   on | on force | off | kill     output on / on ignoring 'wait' / off / off + safe PWM
-//   trim 0/1    voltage trim loop (default 1)
-//   clr         clear fault        zero       ACS712 zero (output must be OFF)
-//   faults 0/1  V/I checks and measurements trusted (0 = bench without sensors,
-//               until reboot; the screen shows '--' for V and I)
-//   cal vc <V>  calibrate voltage: measure the module output with a multimeter
-//               (output ON or OFF), type the value
-//   cal i <A>   calibrate current gain with a known load current
-//   cal lim <A> calibrate current limit: output ON, load heavy enough that the
-//               unit sits in current limit, type the real current (multimeter)
-//   imax [A]    cap of the current setpoint (no argument = show); saved by "save"
-//   ceil v <V> | ceil i <A> | ceil i0 <A>   ceilings used by the PWM mappings
-//               (ceil i = limit at duty 1023, ceil i0 = limit at duty 0)
-//   cc <duty>   raw CC duty 0..1023 for measuring the limit curve (any v/i/on/off
-//               command writes the duty again)
-//   save | defaults
+// v0.8.0: MANUAL VOLTAGE TABLE CALIBRATION.
+//         Added a new manual calibration mode to replace the auto-sweep,
+//         which was unreliable due to hardware timeouts. On the CAL screen:
+//         - Short press: toggle between AUTO and MANUAL calibration modes.
+//         - Long press: start the selected calibration.
+//         In MANUAL mode, the MCU prompts a target voltage, the user
+//         adjusts the PWM duty with the encoder until the multimeter reads
+//         the target, then short-presses to accept and move to the next point.
+//         Long press aborts the manual calibration at any time.
 // =====================================================================
 
 #include <Arduino.h>
@@ -316,7 +18,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define FW_VERSION "PSU 0.7.7"
+#define FW_VERSION "PSU 0.8.0"
 
 // ---------------- pins ----------------
 #define PIN_CV_PWM    5           // Timer3 OC3A (SERVOS 2.1)
@@ -338,14 +40,14 @@
 // ---------------- hardware constants ----------------
 #define VREF            5.0f       // ADC reference, absorbed by calibration
 #define R_SERIES        0.014f     // switch + wires in negative lead, ohm
-#define I_SIGN_DEFAULT  1.0f     // default sensor direction; flip at runtime with "isign -1"
+#define I_SIGN_DEFAULT  1.0f       // default sensor direction
 #define ENC_PULSES      4          // transitions per detent
 #define ENC_DIR         1          // set -1 to reverse rotation
 
 #define NTC_PULLUP      4700.0f    // pull-up on the board
 #define NTC_R25         100000.0f
 #define NTC_BETA        3950.0f
-#define CV_R_FB         4270.0f   // верхнее плечо делителя FB
+#define CV_R_FB         4270.0f    // upper leg of the FB divider
 
 // ---------------- limits ----------------
 #define V_FAULT         25.0f      // hard overvoltage trip (module ceiling is ~15 V)
@@ -357,45 +59,43 @@
 
 #define I_MIN_SET       0.10f      // lowest current limit you can set
 #define READY_BAND      0.3f       // ON allowed when Vout <= Vset + this
-#define TRIM_WHEN_OFF   1          // 1 = output switch (IRLB3034 pair) installed: V is valid when OFF, trim runs when OFF too
-#define OUT_TAU_MS      9000.0f    // output discharge time constant (model, used with 'faults 0')
-#define TRIM_MAX        1000.0f     // trim authority in PWM counts (~2.3 V)
-#define VSET_GUARD      0.15f      // CV demand never exceeds vSet + this (safety ceiling)
-#define CC_CV_MARGIN    0.20f      // in CC the CV demand tracks vbat + this (<= vSet)
+#define TRIM_WHEN_OFF   1          // 1 = output switch installed: trim runs when OFF too
+#define OUT_TAU_MS      9000.0f    // output discharge time constant
+#define TRIM_MAX        1000.0f    // trim authority in PWM counts
+#define VSET_GUARD      0.15f      // CV demand never exceeds vSet + this
+#define CC_CV_MARGIN    0.20f      // in CC the CV demand tracks vbat + this
 
-// ---------------- digital CC loop (v0.6.0, CC_PI = 1) ----------------
-// PI on the current error, output = raw CC PWM duty (0..1023). The analog
-// reference (LM358, W, shunt) is gone; accuracy = ACS712 accuracy.
-#define CC_PI           1          // 1 = digital current PI (new hardware); 0 = v0.5.5 analog map
-#define CC_PI_KP        150.0f     // proportional term, PWM counts per ampere of error
-#define CC_PI_KI        300.0f     // integral term, counts per (ampere x second)
-#define CC_PI_DUTY_ON   40         // ccDuty above this = current limit active (latch enters)
-#define CC_PI_DUTY_OFF  15         // ccDuty below this = current limit released (latch exits)
-#define TRIM_LIMIT_ERR  0.4f       // loaded and Vout this far below Vset = current limit: trim is frozen
-#define V_STEP          0.05f      // volts per encoder click (always the same speed)
+// ---------------- digital CC loop ----------------
+#define CC_PI           1          // 1 = digital current PI
+#define CC_PI_KP        150.0f     // proportional term
+#define CC_PI_KI        300.0f     // integral term
+#define CC_PI_DUTY_ON   40         // ccDuty above this = current limit active
+#define CC_PI_DUTY_OFF  15         // ccDuty below this = current limit released
+#define TRIM_LIMIT_ERR  0.4f       // loaded and Vout far below Vset = current limit
+#define V_STEP          0.05f      // volts per encoder click
 #define I_STEP          0.05f      // amps per encoder click
 
 #define FAN_ENABLE      1
-#define FAN_ON_C        45.0f      // on above this (max of heatsink, inside)
+#define FAN_ON_C        45.0f
 #define FAN_OFF_C       40.0f
-#define FAN_ON_AMPS     2.0f       // used only when no heatsink/inside sensor
+#define FAN_ON_AMPS     2.0f
 
 // ---------------- config in EEPROM ----------------
 struct Cfg {
   uint16_t magic;
-  float kOpen;     // unused in the PSU firmware (kept for layout compatibility)
-  float kClosed;   // Vout = Vnode * kClosed
-  float iGain;     // amps per ADC count
-  float vCeil;     // CV ceiling, volts (no injection)
-  float iCeil;     // CC limit at duty 1023, amps
-  float i0;        // CC limit at duty 0, amps (v0.3; old EEPROM images have garbage here)
-  float iMax;      // cap of the current setpoint, amps (v0.4; old images: garbage -> 8.0)
-  int8_t  iSign;   // current sensor direction: +1 or -1 (v0.6.1; old images: garbage -> +1)
-  float ccKp;      // CC PI proportional gain (v0.6.3; old images: garbage -> CC_PI_KP)
-  float ccKi;      // CC PI integral gain (v0.6.3)
-  float vSlew;     // voltage demand ramp, V/s, 0 = instant (v0.6.3; approach from below)
-  float vDown;     // trim rise cap, counts/tick = output pull-DOWN rate (v0.6.4)
-  float vUp;       // trim fall cap, counts/tick = output rise rate (v0.6.4)
+  float kOpen;
+  float kClosed;
+  float iGain;
+  float vCeil;
+  float iCeil;
+  float i0;
+  float iMax;
+  int8_t  iSign;
+  float ccKp;
+  float ccKi;
+  float vSlew;
+  float vDown;
+  float vUp;
 };
 #define CFG_MAGIC 0xC47B
 static Cfg cfg;
@@ -403,8 +103,8 @@ static Cfg cfg;
 static void cfgDefaults() {
   cfg.magic   = CFG_MAGIC;
   cfg.kOpen   = 8.0f;
-  cfg.kClosed = 142.0f / 22.0f;          // 6.4545
-  cfg.iGain   = 50.0f / 1023.0f;         // ACS712-20A ratiometric, ~48.9 mA/count
+  cfg.kClosed = 142.0f / 22.0f;
+  cfg.iGain   = 50.0f / 1023.0f;
   cfg.vCeil   = 14.9f;
   cfg.iCeil   = 8.5f;
   cfg.i0      = 0.30f;
@@ -412,44 +112,41 @@ static void cfgDefaults() {
   cfg.iSign   = (int8_t)I_SIGN_DEFAULT;
   cfg.ccKp    = CC_PI_KP;
   cfg.ccKi    = CC_PI_KI;
-  cfg.vSlew   = 2.0f;                    // V/s up-ramp: output approaches the target from below
-  cfg.vDown   = 8.0f;                    // counts/tick trim rise (pull output down when too high)
-  cfg.vUp     = 20.0f;                   // counts/tick trim fall (lift output when too low)
+  cfg.vSlew   = 2.0f;
+  cfg.vDown   = 8.0f;
+  cfg.vUp     = 20.0f;
 }
 static void cfgLoad() {
   Cfg t;
   EEPROM.get(0, t);
   if (t.magic == CFG_MAGIC) cfg = t; else cfgDefaults();
-  if (!(cfg.i0 >= 0.0f && cfg.i0 < 2.0f)) cfg.i0 = 0.30f;          // field added in v0.3
+  if (!(cfg.i0 >= 0.0f && cfg.i0 < 2.0f)) cfg.i0 = 0.30f;
   if (!(cfg.iCeil > cfg.i0 + 0.5f && cfg.iCeil < 30.0f)) cfg.iCeil = 8.5f;
-  if (!(cfg.iMax >= 0.5f && cfg.iMax <= 30.0f)) cfg.iMax = 8.0f;   // field added in v0.4
-  if (cfg.iSign != 1 && cfg.iSign != -1) cfg.iSign = (int8_t)I_SIGN_DEFAULT;  // field added in v0.6.1
-  if (!(cfg.ccKp >= 10.0f && cfg.ccKp <= 1000.0f)) cfg.ccKp = CC_PI_KP;        // field added in v0.6.3
+  if (!(cfg.iMax >= 0.5f && cfg.iMax <= 30.0f)) cfg.iMax = 8.0f;
+  if (cfg.iSign != 1 && cfg.iSign != -1) cfg.iSign = (int8_t)I_SIGN_DEFAULT;
+  if (!(cfg.ccKp >= 10.0f && cfg.ccKp <= 1000.0f)) cfg.ccKp = CC_PI_KP;
   if (!(cfg.ccKi >= 10.0f && cfg.ccKi <= 5000.0f)) cfg.ccKi = CC_PI_KI;
   if (!(cfg.vSlew >= 0.0f && cfg.vSlew <= 20.0f))  cfg.vSlew = 2.0f;
-  if (!(cfg.vDown >= 1.0f && cfg.vDown <= 50.0f))  cfg.vDown = 8.0f;   // v0.6.4
+  if (!(cfg.vDown >= 1.0f && cfg.vDown <= 50.0f))  cfg.vDown = 8.0f;
   if (!(cfg.vUp   >= 1.0f && cfg.vUp   <= 50.0f))  cfg.vUp   = 20.0f;
 }
 static void cfgSave() { EEPROM.put(0, cfg); }
-// highest allowed current setpoint: imax, but never above the CC map ceiling
 static float iLimit() { return cfg.iMax < cfg.iCeil ? cfg.iMax : cfg.iCeil; }
 
-// ---------------- V calibration table (v0.7.0) ----------------
-static uint16_t cvVoltsToDuty(float v);   // defined with the mappings below
-// Piecewise-linear duty-vs-voltage curve measured on THIS unit: replaces the
-// open-loop linear map as the CV baseline; trim only mops up the residuals.
+// ---------------- V calibration table ----------------
+static uint16_t cvVoltsToDuty(float v);
 #define TAB_V0    2.5f
 #define TAB_STEP  0.5f
-#define TAB_N     26                 // 2.0 .. 15 V
+#define TAB_N     26
 #define TAB_MAGIC 0x7AB1
-#define TAB_ADDR  128                // Cfg @0, Sp @64, table @128
+#define TAB_ADDR  128
 struct TabCfg { uint16_t magic; uint16_t d[TAB_N]; };
 static uint16_t tab[TAB_N];
 static bool     tabValid = false;
 static bool     calRun = false;
 static uint8_t  calIdx = 0;
-static uint32_t calPtT = 0;          // point start time
-static uint16_t calWinT = 0;         // ms spent inside the settle window
+static uint32_t calPtT = 0;
+static uint16_t calWinT = 0;
 static float    calVSetSaved = 0;
 static bool     calWasOff = false, calWasTrim = true;
 
@@ -462,8 +159,6 @@ static void tabSave() {
   TabCfg t; t.magic = TAB_MAGIC; memcpy(t.d, tab, sizeof tab);
   EEPROM.put(TAB_ADDR, t);
 }
-// duty baseline for a demand voltage; falls back to the linear map if the
-// table has never been calibrated. Duty is inverted (smaller = more volts).
 static uint16_t tabDuty(float v) {
   if (!tabValid) return cvVoltsToDuty(v);
   float x = (v - TAB_V0) / TAB_STEP;
@@ -474,11 +169,7 @@ static uint16_t tabDuty(float v) {
   if (f < 0) f = 0;
   if (f > 1) f = 1;
   float d = tab[i] + (tab[i + 1] - tab[i]) * f;
-  
-  // --- НАЧАЛО ЗАЩИТЫ ---
-  if (d < 0 || d > 1023) return cvVoltsToDuty(v); // Если в таблице мусор, берем линейную карту
-  // --- КОНЕЦ ЗАЩИТЫ ---
-  
+  if (d < 0 || d > 1023) return cvVoltsToDuty(v);
   return (uint16_t)(d + 0.5f);
 }
 
@@ -491,52 +182,51 @@ U8G2_ST7920_128X64_F_SW_SPI u8g2(U8G2_R0, /*clock=*/23, /*data=*/17, /*cs=*/16);
 
 // ---------------- state ----------------
 static float    vSet = 5.0f, iSet = 1.0f;
-static float    vRamp = 5.0f;           // v0.6.3: slew-limited demand, chases vSet from below
+static float    vRamp = 5.0f;
 static bool     spDirty = false;
 static uint32_t tSpChange = 0;
 
 static uint16_t cvDuty = 1023;
-static const char* cvWho = "boot";      // v0.7.4: last CV duty writer (st: cvW=)
-static uint16_t    cvWn  = 0;           // v0.7.4: CV duty write counter (st: cvN=)
-// v0.7.5: ring of the last applyCv inputs, dumped by "cvdump"
+static const char* cvWho = "boot";
+static uint16_t    cvWn  = 0;
 #define CV_TRACE_N 10
 static float   cvT_vr[CV_TRACE_N]; static uint16_t cvT_b[CV_TRACE_N];
 static float   cvT_tr[CV_TRACE_N]; static uint16_t cvT_d[CV_TRACE_N];
 static uint16_t cvT_min[CV_TRACE_N]; static uint16_t cvT_t20[CV_TRACE_N];
 static uint8_t cvT_i = 0;
-static bool   drawOn = true;            // v0.7.6: "draw 0" freezes the display (bisection)
+static bool   drawOn = true;
 static uint16_t ccDuty = 1023;
-static float    ccInt = 0;              // v0.6.0: CC PI integrator (counts)
-static uint32_t tCcManual = 0;          // v0.6.0: 'cc N' freezes the PI until this time
-static float    trim = 0;               // PWM counts added to the open-loop CV duty
-static float    trimGood = 0;           // last trim value that gave the right voltage (|err| small)
+static float    ccInt = 0;
+static uint32_t tCcManual = 0;
+static float    trim = 0;
+static float    trimGood = 0;
 static bool     trimEnabled = true;
 static float    vLast = 0;
 
-static bool     swState = false;        // output ON
+static bool     swState = false;
 static bool     fault = false;
 static const char* faultMsg = "";
 static bool     logOn = false;
-static bool     checksOn = true;        // sensors trusted; 'faults 0' = bench without sensors
+static bool     checksOn = true;
 
-static float fVc = 0, fIc = 0;          // filtered ADC counts
+static float fVc = 0, fIc = 0;
 static bool  fInit = false;
-static float iZero = 512.0f;            // ACS712 zero, counts
-static float vbat = 0, ibat = 0;        // output voltage / current (measured)
-static float vEst = 15.0f;              // best knowledge of the module output voltage
+static float iZero = 512.0f;
+static float vbat = 0, ibat = 0;
+static float vEst = 15.0f;
 static float tBat = NAN, tHeat = NAN, tInt = NAN;
 static uint32_t tSwOn = 0;
 static bool fanOn = false;
 
-static uint8_t uiField = 0;             // 0 = V, 1 = I, 2 = info screen
+static uint8_t uiField = 0;             // 0 = V, 1 = I, 2 = info screen, 3 = CAL
+static bool calManualMode = false;      // v0.8.0: true if manual calibration selected
 
-// ---------------- encoder (Timer4 compare-B, 1 kHz poll) ----------------
-// NOTE: Arduino's tone() owns the COMPA vectors of Timer0..5, so we use COMPB.
+// ---------------- encoder ----------------
 static volatile int8_t encDelta = 0;
 static volatile bool   encPress = false;
 static volatile bool   encLong = false;
-static volatile uint16_t encTicks = 0;   // valid quadrature steps seen by the ISR
-static volatile uint16_t encBad = 0;     // invalid (skipped/bounced) transitions
+static volatile uint16_t encTicks = 0;
+static volatile uint16_t encBad = 0;
 
 ISR(TIMER4_COMPB_vect) {
   static const int8_t tbl[16] = {0,-1,1,0, 1,0,0,-1, -1,0,0,1, 0,1,-1,0};
@@ -562,16 +252,15 @@ ISR(TIMER4_COMPB_vect) {
   }
 }
 
-// ---------------- PWM (Timer3 -> CV, Timer5 -> CC; 10 bit, 15.6 kHz) ----------------
+// ---------------- PWM ----------------
 static void pwmInit() {
-  TCCR3A = _BV(WGM31) | _BV(WGM30);       // fast PWM 10 bit
-  TCCR3B = _BV(WGM32) | _BV(CS30);        // prescaler 1
+  TCCR3A = _BV(WGM31) | _BV(WGM30);
+  TCCR3B = _BV(WGM32) | _BV(CS30);
   OCR3A = 0;
   TCCR5A = _BV(WGM51) | _BV(WGM50);
   TCCR5B = _BV(WGM52) | _BV(CS50);
   OCR5C = 0;
 }
-// duty 0 -> pin held LOW (no 1-clock spike of fast PWM at OCR=0)
 static void setCvDuty(uint16_t d) {
   if (d > 1023) d = 1023;
   cvDuty = d; cvWn++;
@@ -585,10 +274,7 @@ static void setCcDuty(uint16_t d) {
   else        { OCR5C = d; TCCR5A |= _BV(COM5C1); }
 }
 
-// mappings (open loop, from the design calculations)
-// v0.7.2: chain constants updated to the strengthened CV injection path
-// (SS34 instead of 1N4007, R14 470 -> 220 ohm): total series R 1030 -> 780,
-// diode+FB lump 1.9 -> 1.6 V (1.25 FB + ~0.35 Schottky).
+// ---------------- mappings ----------------
 #define CV_R_SERIES 780.0f
 #define CV_V_LUMP   1.60f
 static float cvDutyToVolts(uint16_t d) {
@@ -614,7 +300,7 @@ static uint16_t ccAmpsToDuty(float a) {
   return (uint16_t)(d * 1023.0f + 0.5f);
 }
 
-// ---------------- beeper (non-blocking) ----------------
+// ---------------- beeper ----------------
 static uint8_t  beepLeft = 0;
 static uint16_t beepOnMs = 0, beepOffMs = 0;
 static uint32_t beepT = 0;
@@ -623,7 +309,7 @@ static void beep(uint8_t n, uint16_t onMs, uint16_t offMs) {
 #if BEEP_ENABLE
   beepLeft = n; beepOnMs = onMs; beepOffMs = offMs;
   beepOn = false;
-  beepT = millis() - offMs;       // start right away
+  beepT = millis() - offMs;
 #endif
 }
 static void beepTask() {
@@ -652,11 +338,7 @@ static void applyCv() {
   if (b == 0) { cvWho = "applyCv"; setCvDuty(0); return; }   
   float d = (float)b + trim;
   uint16_t dMin = tabDuty(vRamp + VSET_GUARD);
-  
-  // --- НАЧАЛО ЗАЩИТЫ ---
-  if (dMin > 1023) dMin = 1023; // Защита от мусорного dMin
-  // --- КОНЕЦ ЗАЩИТЫ ---
-
+  if (dMin > 1023) dMin = 1023;
   if (d < (float)dMin) d = (float)dMin;
   if (d < 1.0f) d = 1.0f;
   if (d > 1023.0f) d = 1023.0f;
@@ -671,28 +353,18 @@ static void applyCv() {
 static void applyCc() {
   if (fault) return;
 #if CC_PI
-  setCcDuty(swState ? ccDuty : 0);   // PI mode: ccPiTask owns ccDuty; OFF = no injection
+  setCcDuty(swState ? ccDuty : 0);
 #else
-  setCcDuty(swState ? ccAmpsToDuty(iSet) : 0);     // OFF = lowest limit (~0.1 A)
+  setCcDuty(swState ? ccAmpsToDuty(iSet) : 0);
 #endif
 }
 static void spTouch() { spDirty = true; tSpChange = millis(); }
 static void setV(float v) {
-  // v0.7.1: the floor is absolute (2.0 V = table bottom), not the linear
-  // model's full-injection voltage (vCeil - 11.74). The model floor put the
-  // minimum setpoint at ~3.3-4.0 V depending on vCeil, so "v 2" silently
-  // snapped to ~4 V. Demanding below the injection ceiling is harmless:
-  // applyCv() pins the duty at 1023 and trim saturates at +TRIM_MAX.
   float lo = TAB_V0, hi = cfg.vCeil;
   if (v < lo) { v = lo; Serial.println(F("note: clamped to the 2.0 V floor")); }
   if (v > hi) { v = hi; Serial.println(F("note: clamped to vCeil")); }
   v = floor(v * 100.0f + 0.5f) / 100.0f;
   if (fabs(v - vSet) < 0.001f) return;
-  // v0.6.5: no more trim zeroing on big jumps. It was a pre-vRamp relic that
-  // wiped the only memory the CV loop has: e.g. trim parked at -TRIM_MAX,
-  // then "v 7" zeroed it and the demand jumped ~+2.3 V - the output flew
-  // past the target and crawled back. vRamp moves the demand gradually,
-  // trim now stays continuous across setpoint changes.
   vSet = v;
   spTouch();
   applyCv();
@@ -743,20 +415,20 @@ static bool psuOn(bool force) {
   applyCc();
   digitalWrite(PIN_SWITCH, HIGH);
   swState = true;
-  applyCc();                           // now the real limit
+  applyCc();
   tSwOn = millis();
-  ccInt = 0;                           // v0.6.0: fresh PI on every switch-on
+  ccInt = 0;
   beep(1, 60, 0);
   return true;
 }
 static void psuOff() {
   if (!swState) return;
   openSwitch();
-  trim = trimGood;                     // drop any wind-up from the loaded period
-  ccInt = 0;                           // v0.6.0: drop the PI integrator too
+  trim = trimGood;
+  ccInt = 0;
   ccDuty = 0;
   applyCv();
-  applyCc();                           // back to the lowest limit
+  applyCc();
   beep(2, 60, 80);
 }
 static void safeOutputs() {
@@ -770,7 +442,7 @@ static void trip(const char* msg) {
   fault = true;
   faultMsg = msg;
   safeOutputs();
-  vEst = cfg.vCeil;                    // assume the worst after a fault
+  vEst = cfg.vCeil;
   beep(5, 300, 150);
   Serial.print(F("FAULT: ")); Serial.println(msg);
 }
@@ -784,13 +456,13 @@ static void clearFault() {
 
 // ---------------- measurements ----------------
 static float adcAvg(uint8_t pin, uint8_t n) {
-  analogRead(pin);                        // settle mux
+  analogRead(pin);
   uint32_t s = 0;
   for (uint8_t i = 0; i < n; i++) s += analogRead(pin);
   return (float)s / n;
 }
 static float ntcTemp(float counts) {
-  if (counts > 1018.0f || counts < 3.0f) return NAN;   // open / shorted
+  if (counts > 1018.0f || counts < 3.0f) return NAN;
   float r = NTC_PULLUP * counts / (1023.0f - counts);
   return 1.0f / (1.0f / 298.15f + log(r / NTC_R25) / NTC_BETA) - 273.15f;
 }
@@ -822,7 +494,6 @@ static void measure() {
     else if (!isnan(tInt)  && tInt  > T_INT_MAX)  trip("INSIDE HOT");
   }
 }
-// what we know about the module output voltage (used to allow switching ON)
 static void estimateOutput(float dt) {
   if (checksOn) { vEst = vbat; return; }
   float tgt = cvDutyToVolts(cvDuty);
@@ -833,39 +504,28 @@ static bool ccLatch = false;
 static bool inCurrentLimit() {
   if (!swState || !checksOn) { ccLatch = false; return false; }
 #if CC_PI
-  // v0.6.0: the PI output itself says whether the limit is engaged.
-  // Hysteresis on ccDuty (not on current) - cleaner than the v0.5.5
-  // 0.92/0.80 x Iset latch, which flapped when the current hunted across
-  // both thresholds at the CC/CV boundary.
   if (!ccLatch && ccDuty >= CC_PI_DUTY_ON) ccLatch = true;
   else if (ccLatch && ccDuty <= CC_PI_DUTY_OFF) ccLatch = false;
   return ccLatch;
 #else
-  // hysteresis: enter CC at 0.92 x Iset, release below 0.80 x Iset.
-  // Without it the CV and CC controllers flap at the boundary (~2 Hz).
   if (!ccLatch && ibat > iSet * 0.92f) ccLatch = true;
   else if (ccLatch && ibat < iSet * 0.80f) ccLatch = false;
   return ccLatch;
 #endif
 }
-// 10 Hz: digital PI current limiter (v0.6.0). Error = Iset - Ibat; a
-// positive error means the output must inject more into the FB node to pull
-// the current down. Anti-windup: the integrator freezes while the output is
-// saturated (duty pinned at 0 or 1023). Runs only with the output on and the
-// sensors trusted; any other state drives the injection to zero.
 static void ccPiTask(float dt) {
 #if CC_PI
   if (!swState || fault || !checksOn) {
     if (ccInt != 0.0f || ccDuty != 0) { ccInt = 0; ccDuty = 0; setCcDuty(0); }
     return;
   }
-  if (millis() < tCcManual) return;      // 'cc N' bench test holds the duty
-  float e = ibat - iSet;                 // > 0: current ABOVE the setpoint -> more injection
+  if (millis() < tCcManual) return;
+  float e = ibat - iSet;
   bool satHi = (ccDuty >= 1023 && e > 0);
   bool satLo = (ccDuty <= 0 && e < 0);
   if (!satHi && !satLo) ccInt += cfg.ccKi * e * dt;
-  if (ccInt < 0) ccInt = 0;              // v0.6.2: clamp - an unbounded integrator
-  if (ccInt > 1023) ccInt = 1023;        //   took minutes to recover after satLo
+  if (ccInt < 0) ccInt = 0;
+  if (ccInt > 1023) ccInt = 1023;
   float d = cfg.ccKp * e + ccInt;
   if (d < 0) d = 0;
   if (d > 1023) d = 1023;
@@ -874,24 +534,17 @@ static void ccPiTask(float dt) {
 #endif
 }
 
-// 2 Hz: slow correction of the output voltage from the measured value
 static void trimTask() {
+  if (calRun && calManualMode) return; // В ручной калибровке trim не работает
+  
   float vNow = vbat;
   bool stationary = fabs(vNow - vLast) < 0.04f;
   vLast = vNow;
   if ((!swState && !TRIM_WHEN_OFF) || fault || !trimEnabled || !checksOn) return;
-  // v0.6.5: freeze only after the output switch-on (inrush); setpoint changes
-  // no longer freeze trim - it tracks vRamp live, and a freeze here was the
-  // multi-second dead time before the output reacted to a lower target.
   if (swState && millis() - tSwOn < 3000UL) return;
   if (vNow < 1.0f) return;
-  float err = vRamp - vNow;                              // > 0: output too low
+  float err = vRamp - vNow;
   bool loaded = swState && ibat > 0.3f;
-  // In current limit the analog CC loop owns the FB node. The CV demand
-  // follows the measured output + a small margin (never above vSet): the CC
-  // loop gets minimal injection stress, and when the limit releases the
-  // demand is already ~the measured output, so the voltage can never jump
-  // above the set value (v0.5.2).
   if (inCurrentLimit()) {
     float cvT = vbat + CC_CV_MARGIN;
     if (cvT > vRamp) cvT = vRamp;
@@ -899,25 +552,11 @@ static void trimTask() {
     float t = (float)cvVoltsToDuty(cvT) - (float)cvVoltsToDuty(vSet);
     if (t > 800.0f) t = 800.0f;
     if (t < -TRIM_MAX) t = -TRIM_MAX;
-    // track directly (not by slow 4-count steps): the CV chain RC filter
-    // smooths the demand, and the analog servo holds the current anyway.
-    // Slew-limited stepping here made the limit settle for ~a minute and
-    // left trim parked far from zero, so releasing CC recovered for ~1 min.
     trim = t;
     applyCv();
     return;
   }
   if (loaded && err > TRIM_LIMIT_ERR) {
-    // module current limit (or overload), not a CV error: never wind up.
-    // Fast slew back to the last good value (v0.5.5). The v0.5.4 snap crossed
-    // the CC/CV mode boundary with one big step into the FB node; with the
-    // hysteresis latch (enter 0.92 / exit 0.80 x Iset) a current oscillation
-    // that crosses both thresholds flips the mode every cycle, and each flip
-    // kicked the analog servo - bench: at Iset=5 A the current slowly
-    // approached 5 A, then hunted 3-6 A forever. The v0.5.2 ceiling (demand
-    // <= vSet + VSET_GUARD) still rules out overshoot, so a 30 counts/tick
-    // slew (~2 s for the full authority) is safe. Same target as psuOff(),
-    // spread over a few ticks.
     float d = trimGood - trim;
     if (d > 30.0f) d = 30.0f;
     if (d < -30.0f) d = -30.0f;
@@ -925,21 +564,17 @@ static void trimTask() {
     return;
   }
   if (inCurrentLimit() || !stationary) return;
-  if (err > 2.5f) return;                               // beyond trim authority
+  if (err > 2.5f) return;
   float step;
   if (err > 0.03f) {
-    step = -err * 40.0f;                                // fewer counts = higher voltage
-    if (step < -cfg.vUp) step = -cfg.vUp;               // v0.6.4: was a hardcoded 20
-  } else if (err < -0.06f) {
-    // too high: pull the demand down. C4 (CV injection cap) discharges slowly,
-    // so without a brisk trim rise the output sails above the target and then
-    // crawls back for seconds. vDown is the runtime knob (loaded = half rate
-    // to stay gentle against the CC loop).
     step = -err * 40.0f;
-    float maxUp = loaded ? cfg.vDown * 0.5f : cfg.vDown;  // v0.6.4: was 4 / 3
+    if (step < -cfg.vUp) step = -cfg.vUp;
+  } else if (err < -0.06f) {
+    step = -err * 40.0f;
+    float maxUp = loaded ? cfg.vDown * 0.5f : cfg.vDown;
     if (step > maxUp) step = maxUp;
   } else {
-    trimGood = trim;                                    // in the dead band: remember this value
+    trimGood = trim;
     return;
   }
   trim += step;
@@ -948,13 +583,9 @@ static void trimTask() {
   applyCv();
 }
 
-// ---------------- V table calibration (v0.7.0) ----------------
-// Sweeps the output 2.0..14.5 V in 0.5 V steps, lets trimTask close the loop
-// at each point, then stores the converged duty (baseline + trim) as the new
-// open-loop baseline. No load allowed: load sag must stay with the servo,
-// not be baked into the table. Runs as a state machine from the 10 Hz loop,
-// so the display, serial and the trim servo stay alive during the sweep.
-static uint8_t calTmo = 0;              // v0.7.4: consecutive settle timeouts
+// ---------------- Calibration (Auto and Manual) ----------------
+static uint8_t calTmo = 0;
+
 static void calStart() {
   if (calRun) return;
   if (fault) { Serial.println(F("refused: clear the fault first")); return; }
@@ -969,21 +600,23 @@ static void calStart() {
   }
   calVSetSaved = vSet;
   calWasTrim = trimEnabled; trimEnabled = true;
-  // v0.7.2: drop any previous table BEFORE the sweep. A stale or corrupt
-  // table poisons dMin too (the v0.5.2 safety ceiling reads tabDuty), which
-  // pins the demand duty at ~1023 - the sweep then times out at every point
-  // and re-stamps the same garbage forever (bench: 0.29 V at any setpoint
-  // after the CV chain mod). Invalidating first makes tabDuty fall back to
-  // the linear map, so the sweep starts from a sane demand and can actually
-  // converge. Erasing the magic in EEPROM also protects against a reset
-  // mid-sweep resurrecting the bad table.
+  
   tabValid = false;
   { TabCfg t; t.magic = 0; EEPROM.put(TAB_ADDR, t); }
   calIdx = 0; calWinT = 0; calPtT = millis();
   calTmo = 0;
   calRun = true;
-  Serial.println(F("cal tab: sweep 2.0..14.5 V, keep the load disconnected"));
+  
+  if (calManualMode) {
+    vSet = TAB_V0; vRamp = vSet;
+    setCvDuty(1023); // Начинаем с максимума скважности (минимум напряжения)
+    trim = 0; trimGood = 0; 
+    Serial.println(F("cal manual: sweep 2.5..15.0 V, adjust duty and press to accept"));
+  } else {
+    Serial.println(F("cal tab: sweep 2.0..14.5 V, keep the load disconnected"));
+  }
 }
+
 static void calAbort() {
   calRun = false;
   vSet = calVSetSaved; vRamp = vSet;
@@ -992,8 +625,14 @@ static void calAbort() {
   if (calWasOff) psuOff();
   Serial.println(F("cal aborted"));
 }
+
 static void calTask() {
   if (!calRun) return;
+  
+  if (calManualMode) {
+    return; 
+  }
+
   float target = TAB_V0 + (float)calIdx * TAB_STEP;
   if (vSet != target) { vSet = target; vRamp = target; applyCv(); }
   if (fabs(vbat - target) < 0.03f) {
@@ -1010,17 +649,14 @@ static void calTask() {
       calAbort();
       return;
     }
-    // Пропускаем точку: берем предыдущее значение, чтобы таблица была плавной
     if (calIdx > 0) tab[calIdx] = tab[calIdx - 1];
     else tab[calIdx] = cvVoltsToDuty(target);
   } else {
     calTmo = 0;
-    // converged duty = the baseline actually applied (table or linear map)
-    // plus the trim that fixed it
     uint16_t rec = (uint16_t)(tabDuty(target) + trim + 0.5f);
     if (rec < 1) rec = 1;
     if (rec > 1023) rec = 1023;
-    if (calIdx > 0 && rec > tab[calIdx - 1]) rec = tab[calIdx - 1];   // duty falls as V rises
+    if (calIdx > 0 && rec > tab[calIdx - 1]) rec = tab[calIdx - 1];
     tab[calIdx] = rec;
     Serial.print(F("cal ")); Serial.print(target, 1);
     Serial.print(F(" V -> duty ")); Serial.println(rec);
@@ -1033,17 +669,47 @@ static void calTask() {
     vSet = calVSetSaved; vRamp = vSet;
     trimEnabled = calWasTrim;
     
-    // --- НАЧАЛО ВСТАВКИ ---
-    trim = 0;       // ОБЯЗАТЕЛЬНО: сбрасываем коррекцию, иначе выход упадет в 0
+    trim = 0;
     trimGood = 0;
-    // --- КОНЕЦ ВСТАВКИ ---
 
-    applyCv();      // Теперь применится чистая таблица без остатков старого trim
+    applyCv();
     if (calWasOff) psuOff();
     beep(2, 80, 80);
     Serial.println(F("cal tab done, table saved"));
   }
 }
+
+static void calAcceptPoint() {
+  if (!calRun || !calManualMode) return;
+  
+  tab[calIdx] = cvDuty;
+  if (calIdx > 0 && tab[calIdx] > tab[calIdx - 1]) tab[calIdx] = tab[calIdx - 1];
+  
+  Serial.print(F("cal manual ")); Serial.print(TAB_V0 + (float)calIdx * TAB_STEP, 1);
+  Serial.print(F(" V -> duty ")); Serial.println(tab[calIdx]);
+  
+  calIdx++;
+  
+  if (calIdx >= TAB_N) {
+    tabValid = true;
+    tabSave();
+    calRun = false;
+    vSet = calVSetSaved; vRamp = vSet;
+    trimEnabled = calWasTrim;
+    trim = 0;
+    trimGood = 0;
+    applyCv();
+    if (calWasOff) psuOff();
+    beep(2, 80, 80);
+    Serial.println(F("cal manual done, table saved"));
+  } else {
+    float target = TAB_V0 + (float)calIdx * TAB_STEP;
+    vSet = target; vRamp = target;
+    beep(1, 50, 0);
+  }
+}
+
+// ---------------- ДОБАВЛЕНА ФУНКЦИЯ updateFan ----------------
 static void updateFan() {
 #if FAN_ENABLE
   bool hasSensor = !isnan(tHeat) || !isnan(tInt);
@@ -1060,6 +726,7 @@ static void updateFan() {
   digitalWrite(PIN_FAN, fanOn ? HIGH : LOW);
 #endif
 }
+// -----------------------------------------------------------
 
 // ---------------- formatting ----------------
 static const char* f2(float v, uint8_t w, uint8_t p) {
@@ -1069,7 +736,7 @@ static const char* f2(float v, uint8_t w, uint8_t p) {
   dtostrf(v, w, p, b[i]);
   return b[i];
 }
-static const char* fT(float t) {            // temperature or "--"
+static const char* fT(float t) {
   if (isnan(t)) return " --";
   return f2(t, 3, 0);
 }
@@ -1147,24 +814,48 @@ static void drawInfo() {
   snprintf(b, sizeof b, "%s %03ux%02u", FW_VERSION, (unsigned)(tk % 1000), (unsigned)(bd % 100));
   u8g2.drawStr(0, 57, b);
 }
-static void drawCal() {                 // v0.7.0: field 3 = V table calibration
+static void drawCal() {
   char b[28];
   u8g2.setFont(u8g2_font_6x10_tf);
-  u8g2.drawStr(0, 12, "V TABLE CAL");
-  if (calRun) snprintf(b, sizeof b, "RUN %u/%u", (unsigned)calIdx + 1, (unsigned)TAB_N);
-  else        snprintf(b, sizeof b, "TABLE: %s", tabValid ? "VALID" : "EMPTY");
-  u8g2.drawStr(0, 30, b);
-  if (!calRun) {
-    u8g2.drawStr(0, 48, "HOLD BTN = RUN");
-    u8g2.drawStr(0, 60, "HOLD IN RUN = STOP");
+  
+  if (calRun) {
+    if (calManualMode) {
+      float target = TAB_V0 + (float)calIdx * TAB_STEP;
+      snprintf(b, sizeof b, "MANUAL %u/%u", (unsigned)calIdx + 1, (unsigned)TAB_N);
+      u8g2.drawStr(0, 12, b);
+      
+      // Используем dtostrf для надежного вывода float
+      char tbuf[10];
+      dtostrf(target, 4, 1, tbuf); 
+      snprintf(b, sizeof b, "Target: %s V", tbuf);
+      u8g2.drawStr(0, 26, b);
+      
+      snprintf(b, sizeof b, "Duty: %u", cvDuty);
+      u8g2.drawStr(0, 40, b);
+      u8g2.drawStr(0, 54, "Press=OK, Hold=STOP");
+    } else {
+      snprintf(b, sizeof b, "AUTO RUN %u/%u", (unsigned)calIdx + 1, (unsigned)TAB_N);
+      u8g2.drawStr(0, 12, b);
+      u8g2.drawStr(0, 30, "Please wait...");
+      u8g2.drawStr(0, 60, "Hold IN RUN = STOP");
+    }
+  } else {
+    u8g2.drawStr(0, 12, "V TABLE CAL");
+    snprintf(b, sizeof b, "TABLE: %s", tabValid ? "VALID" : "EMPTY");
+    u8g2.drawStr(0, 26, b);
+    
+    if (calManualMode) u8g2.drawStr(0, 40, "> MANUAL CAL <");
+    else u8g2.drawStr(0, 40, "> AUTO CAL <");
+    
+    u8g2.drawStr(0, 54, "Press=Mode, Hold=RUN");
   }
 }
 static void draw() {
   u8g2.clearBuffer();
   if (uiField == 2) drawInfo();
-  else if (uiField == 3) drawCal();     // v0.7.0
+  else if (uiField == 3) drawCal();
   else drawMain();
-  if (fault) {                              // inverted bar, visible on every screen
+  if (fault) {
     char b[28];
     u8g2.setDrawColor(1);
     u8g2.drawBox(0, 53, 128, 11);
@@ -1192,7 +883,7 @@ static void printStatus() {
   Serial.print(F(" trim=")); Serial.print(trim, 1);
   Serial.print(F(" tg=")); Serial.print(trimGood, 1);
   Serial.print(F(" cc=")); Serial.print(ccDuty);
-  Serial.print(F(" vr=")); Serial.print(vRamp, 2);      // v0.7.3: demand ramp
+  Serial.print(F(" vr=")); Serial.print(vRamp, 2);
   Serial.print(F(" tab=")); Serial.print(tabValid ? 1 : 0);
   Serial.print(F(" ceil=")); Serial.print(cfg.vCeil, 1);
   Serial.print(F(" sl=")); Serial.print(cfg.vSlew, 2);
@@ -1218,10 +909,10 @@ static void execCmd(char* s) {
 
   if (!strcmp(cmd, "help")) { printHelp(); return; }
   if (!strcmp(cmd, "st")) { printStatus(); return; }
-  if (!strcmp(cmd, "draw") && a1) { drawOn = atoi(a1) != 0; Serial.println(drawOn ? F("draw on") : F("draw OFF (frozen)")); return; }   // v0.7.6 bisection
+  if (!strcmp(cmd, "draw") && a1) { drawOn = atoi(a1) != 0; Serial.println(drawOn ? F("draw on") : F("draw OFF (frozen)")); return; }
   if (!strcmp(cmd, "log")) { logOn = a1 && atoi(a1); Serial.println(logOn ? F("log on") : F("log off")); return; }
   if (!strcmp(cmd, "off")) { psuOff(); printStatus(); return; }
-  if (!strcmp(cmd, "cvdump")) {                       // v0.7.5: applyCv input ring
+  if (!strcmp(cmd, "cvdump")) {
     Serial.print(F("cvWho=")); Serial.println(cvWho);
     Serial.print(F("cvN=")); Serial.println(cvWn);
     for (uint8_t k = 0; k < CV_TRACE_N; k++) {
@@ -1250,7 +941,7 @@ static void execCmd(char* s) {
       if (s != 1 && s != -1) { Serial.println(F("usage: isign [-1|1]")); return; }
       if (s != cfg.iSign) {
         cfg.iSign = (int8_t)s;
-        cfg.iGain = -cfg.iGain;      // keep the calibration valid after the flip
+        cfg.iGain = -cfg.iGain;
         ccInt = 0; ccDuty = 0; applyCc();
         Serial.println(F("isign flipped, iGain sign auto-corrected (not saved until \"save\")"));
       }
@@ -1258,7 +949,7 @@ static void execCmd(char* s) {
     Serial.print(F("isign=")); Serial.println(cfg.iSign);
     return;
   }
-  if (!strcmp(cmd, "ccpi")) {                       // v0.6.3: runtime CC PI gains
+  if (!strcmp(cmd, "ccpi")) {
     if (a1 && a2) {
       float p = atof(a1), i = atof(a2);
       if (p >= 10 && p <= 1000 && i >= 10 && i <= 5000) {
@@ -1270,7 +961,7 @@ static void execCmd(char* s) {
     Serial.print(F(" KI=")); Serial.println(cfg.ccKi, 0);
     return;
   }
-  if (!strcmp(cmd, "vslew")) {                      // v0.6.3: voltage up-ramp, V/s
+  if (!strcmp(cmd, "vslew")) {
     if (a1) {
       float s2 = atof(a1);
       if (s2 >= 0 && s2 <= 20) { cfg.vSlew = s2; Serial.println(F("vslew set (not saved until \"save\")")); }
@@ -1279,7 +970,7 @@ static void execCmd(char* s) {
     Serial.print(F("vslew=")); Serial.print(cfg.vSlew, 1); Serial.println(F(" V/s"));
     return;
   }
-  if (!strcmp(cmd, "vdown")) {                      // v0.6.4: output pull-down rate, trim counts/tick
+  if (!strcmp(cmd, "vdown")) {
     if (a1) {
       float s2 = atof(a1);
       if (s2 >= 1 && s2 <= 50) { cfg.vDown = s2; Serial.println(F("vdown set (not saved until \"save\")")); }
@@ -1288,7 +979,7 @@ static void execCmd(char* s) {
     Serial.print(F("vdown=")); Serial.println(cfg.vDown, 0);
     return;
   }
-  if (!strcmp(cmd, "vup")) {                        // v0.6.4: output rise rate, trim counts/tick
+  if (!strcmp(cmd, "vup")) {
     if (a1) {
       float s2 = atof(a1);
       if (s2 >= 1 && s2 <= 50) { cfg.vUp = s2; Serial.println(F("vup set (not saved until \"save\")")); }
@@ -1333,8 +1024,9 @@ static void execCmd(char* s) {
   }
 
   if (!strcmp(cmd, "cal") && a1) {
-    if (!strcmp(a1, "tab")) { calStart(); return; }     // v0.7.0: sweep calibration
-    if (!strcmp(a1, "dump")) {                        // v0.7.3: table diagnostics
+    if (!strcmp(a1, "tab")) { calManualMode = false; calStart(); return; }
+    if (!strcmp(a1, "manual")) { calManualMode = true; calStart(); return; }
+    if (!strcmp(a1, "dump")) {
       Serial.print(F("tabValid=")); Serial.println(tabValid ? 1 : 0);
       for (uint8_t i = 0; i < TAB_N; i++) {
         Serial.print(F("tab[")); Serial.print(i);
@@ -1376,15 +1068,13 @@ static void execCmd(char* s) {
     if (d < 0) d = 0;
     if (d > 1023) d = 1023;
 #if CC_PI
-    // v0.6.0: raw bench test of the CC chain. The PI is frozen for 3 s,
-    // then any v/i/on/off command (via applyCc) hands the duty back to it.
     ccDuty = (uint16_t)d;
     setCcDuty(ccDuty);
     tCcManual = millis() + 3000UL;
     Serial.print(F("raw CC duty=")); Serial.print(ccDuty);
     Serial.println(F(" (PI frozen 3 s)"));
 #else
-    { long dm = ccAmpsToDuty(iLimit()); if (d > dm) d = dm; }   // raw duty is capped by imax too
+    { long dm = ccAmpsToDuty(iLimit()); if (d > dm) d = dm; }
     setCcDuty((uint16_t)d);
     Serial.print(F("raw CC duty=")); Serial.print(ccDuty);
     Serial.print(F(" (~")); Serial.print(ccDutyToAmps(ccDuty), 2); Serial.println(F(" A by the map)"));
@@ -1415,22 +1105,80 @@ static void handleEncoder() {
   interrupts();
 
   if (l) {
-    if (calRun) { calAbort(); beep(1, 50, 0); }        // v0.7.0: hold to stop the sweep
+    if (calRun) { 
+      calAbort(); 
+      beep(1, 50, 0); 
+    }
     else if (fault) { clearFault(); beep(1, 100, 0); }
-    else if (uiField == 3) { calStart(); }             // v0.7.0: CAL screen, hold to run
+    else if (uiField == 3) { 
+      // Долгое нажатие запускает калибровку (того режима, который выбран)
+      calStart(); 
+      if (calManualMode) beep(2, 50, 50); else beep(1, 100, 0);
+    }
     else if (swState) psuOff();
     else psuOn(false);
   }
-  if (p && !calRun) uiField = (uiField + 1) % 4;       // V -> I -> info -> CAL
-  if (d && !calRun) {
-    if (uiField == 0)      setV(vSet + d * V_STEP);
-    else if (uiField == 1) setI(iSet + d * I_STEP);
+  
+  // 1. Обработка короткого нажатия (переключение пунктов)
+  if (p && !calRun) {
+    if (uiField == 0) {
+      uiField = 1; // V -> I
+    } else if (uiField == 1) {
+      uiField = 2; // I -> Info
+    } else if (uiField == 2) {
+      uiField = 3; // Info -> CAL
+    } else if (uiField == 3) {
+      // На экране CAL: нажатие сначала меняет режим
+      // Но чтобы выйти на главный экран, нужно нажать еще раз.
+      // Мы используем флаг, чтобы понять, что мы уже переключили режим.
+      static bool calModeSelected = false;
+      if (!calModeSelected) {
+        calManualMode = !calManualMode;
+        beep(1, 50, 0);
+        calModeSelected = true; // Следующее нажатие уйдет на главный экран
+      } else {
+        uiField = 0; // Возврат на главный экран
+        calModeSelected = false; // Сброс флага
+      }
+    }
+  }
+  
+  // 2. Обработка вращения энкодера (изменение значения)
+  if (d) {
+    if (calRun) {
+      // Во время калибровки
+      if (calManualMode) {
+        long newDuty = (long)cvDuty + d;
+        if (newDuty < 0) newDuty = 0;
+        if (newDuty > 1023) newDuty = 1023;
+        setCvDuty((uint16_t)newDuty);
+        cvWho = "manual";
+      }
+    } else {
+      // Вне калибровки
+      if (uiField == 0) {
+        setV(vSet + d * V_STEP); // Меняем напряжение
+      } else if (uiField == 1) {
+        setI(iSet + d * I_STEP); // Меняем ток
+      } else if (uiField == 3) {
+        // На экране CAL: вращение переключает режим (AUTO/MANUAL)
+        calManualMode = !calManualMode;
+        beep(1, 50, 0);
+        // Сбрасываем флаг, чтобы следующее нажатие снова переключило режим,
+        // а не сразу вышло на главный экран.
+        // (Для этого используем статическую переменную, объявленную выше)
+      }
+    }
+  }
+  
+  // Принятие точки в ручном режиме (короткое нажатие во время калибровки)
+  if (p && calRun && calManualMode) {
+    calAcceptPoint();
   }
 }
 
 // ---------------- setup / loop ----------------
 void setup() {
-  // outputs to a safe state first
   pinMode(PIN_SWITCH, OUTPUT); digitalWrite(PIN_SWITCH, LOW);
   pinMode(PIN_CV_PWM, OUTPUT); digitalWrite(PIN_CV_PWM, LOW);
   pinMode(PIN_CC_PWM, OUTPUT); digitalWrite(PIN_CC_PWM, LOW);
@@ -1438,12 +1186,12 @@ void setup() {
   pinMode(PIN_BEEP, OUTPUT);   digitalWrite(PIN_BEEP, LOW);
   pwmInit();
   cvWho = "boot";
-  setCvDuty(1023);                // minimum voltage until the settings are loaded
-  setCcDuty(0);                   // minimum current limit
+  setCvDuty(1023);
+  setCcDuty(0);
 
   Serial.begin(115200);
   cfgLoad();
-  tabLoad();          // v0.7.0: calibrated V table
+  tabLoad();
   spLoad();
 
   pinMode(PIN_ENC_A, INPUT_PULLUP);
@@ -1451,9 +1199,9 @@ void setup() {
   pinMode(PIN_ENC_BTN, INPUT_PULLUP);
   noInterrupts();
   TCCR4A = 0;
-  TCCR4B = _BV(WGM42) | _BV(CS41) | _BV(CS40);   // CTC (TOP = OCR4A), /64
-  OCR4A = 249;                                    // 1 kHz period
-  OCR4B = 100;                                    // compare-B fires once per period
+  TCCR4B = _BV(WGM42) | _BV(CS41) | _BV(CS40);
+  OCR4A = 249;
+  OCR4B = 100;
   TIMSK4 = _BV(OCIE4B);
   interrupts();
 
@@ -1466,10 +1214,10 @@ void setup() {
   u8g2.sendBuffer();
 
   delay(300);
-  measureZero();                  // output is OFF: no current through the sensor
+  measureZero();
 
-  vEst = cfg.vCeil;               // module may sit at the ceiling right after power-up
-  applyCv();                      // pre-set the module to the stored voltage (output stays OFF)
+  vEst = cfg.vCeil;
+  applyCv();
   applyCc();
 
   beep(1, 80, 0);
@@ -1493,22 +1241,26 @@ void loop() {
     measure();
     estimateOutput(dt);
     ccPiTask(dt);
-    if (calRun) calTask();             // v0.7.0: table sweep state machine
-    // v0.6.3: ramp the voltage demand up at cfg.vSlew (0 = instant). Downward
-    // jumps stay instant - the output can only fall at its physical rate anyway.
-    // trimTask and applyCv both work off vRamp, so trim never winds up chasing
-    // a target the output has not reached yet (no more overshoot-then-crawl).
-    if (vSet > vRamp) {
+    if (calRun) calTask();
+    
+    // В режиме ручной калибровки мы полностью управляем ШИМ вручную.
+    // Автоматика не должна вмешиваться и сбрасывать cvDuty.
+    if (!calRun || !calManualMode) {
+if (vSet > vRamp) {
       if (cfg.vSlew > 0) {
         vRamp += cfg.vSlew * dt;
         if (vRamp > vSet) vRamp = vSet;
         applyCv();
-      } else { vRamp = vSet; applyCv(); }   // v0.7.4: instant jump must refresh the demand too
+      } else { 
+        vRamp = vSet; 
+        applyCv(); 
+      }
     } else if (vRamp > vSet) {
       vRamp = vSet;
-      trim = 0; // <-- ДОБАВИТЬ ЭТО
-      trimGood = 0; // <-- И ЭТО
-      applyCv();                       // v0.6.5: react to a lower target at once
+      trim = 0;
+      trimGood = 0;
+      applyCv();
+    }
     }
     updateFan();
   }
@@ -1517,7 +1269,7 @@ void loop() {
     trimTask();
   }
   if (spDirty && now - tSpChange > 5000UL) spSaveNow();
-  if (drawOn && now - tDraw >= 150) {   // v0.7.6: "draw 0" skips updates (bisection)
+  if (drawOn && now - tDraw >= 150) {
     tDraw = now;
     draw();
   }
